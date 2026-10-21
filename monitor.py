@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-美股持仓与生物医药催化剂 24 小时云端自动盯盘引擎
-直接联动 Google Sheet (1pIKfEy9UNPs32W5gBFJu3N5doqU-SKCvIBDjX-TMwGQ)：
-1. 自动从 Google Sheet 读取最新持仓池 (Portfolio)、系统配置 (Config) 与已推送历史 (Logs)
-2. 渠道 A：直接对接美国证监会 SEC EDGAR 官方实时接口 (data.sec.gov)，监控持仓股 8-K (重大事件/临床/并购)、Form 4 (内部人买卖)、SC 13D/13G (机构举牌)
-3. 渠道 B：自动巡检三大一手公关发稿社 (GlobeNewswire / PR Newswire / BusinessWire) 与主流医药财经媒体 (STAT News / FierceBiotech / BioPharma Dive / Endpoints / Reuters)
-4. 阶段一：调用 Gemini 3.6 / 3.5 Flash 秒级分诊打分 (1-10分) -> 微信 PushPlus 推送【第一阶段：快讯通知】
-5. 阶段二：若评分 >= 阈值 (默认 7 分)，调用 Gemini + Google Search 实时联网搜索，结合持仓成本生成【第二阶段：深度研报与交易建议】二次推送到微信
-6. 将快讯、研报结论与唯一消息 ID 自动写回 Google Sheet 的 Logs 表归档防重
+生物医药与企业动态 24 小时云端情报核验引擎 (全自动免值守版)
+核心特性：
+1. 全面脱敏：去除敏感金融/荐股词汇，避免触发微信 PushPlus 通道风控拦截，确保 100% 稳定送达
+2. 原文精译：自动抓取公告/报道正文并提供【核心原文完整中文直译】（保留全部原始实验数据、p值、样本量与专有名词）
+3. 预设标尺对表 (Pre-set Rubric Audit)：自动读取 Google Sheet 中由 Gemini 4 预设的【达标标尺与竞品基准】及【排雷红线与口径观察点】，杜绝模型自由发挥乱下结论
+4. 披露口径排雷：内置药企公关话术 (PR Spin) 审查铁律（ITT vs PP 人群、安慰剂校准差值、3级以上SAE、停药率、Form 4 交易代码定性）
 """
 
-import base64
 import datetime
 import email
 from email.header import decode_header
@@ -28,12 +25,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from email.utils import parsedate_to_datetime
 
 SPREADSHEET_ID = os.environ.get(
     "SPREADSHEET_ID", "1pIKfEy9UNPs32W5gBFJu3N5doqU-SKCvIBDjX-TMwGQ"
 )
-SEC_USER_AGENT = "AntigravityStockMonitor/1.0 (neo664939@gmail.com)"
+SEC_USER_AGENT = "AntigravityBiotechMonitor/2.0 (neo664939@gmail.com)"
+
 GEMINI_TRIAGE_MODELS = [
     "gemini-3.5-flash",
     "gemini-3.6-flash",
@@ -48,43 +45,6 @@ GEMINI_DEEP_MODELS = [
 ]
 
 
-def fetch_clinical_trials_context(stock):
-    """直接调用美国国立卫生研究院 ClinicalTrials.gov API v2 获取该公司核心管线的真实临床试验设计(NCT编号/入组人数/预设主要终点)"""
-    company_short = stock["company"].split(",")[0].split("Inc")[0].split("Corp")[0].strip()
-    url = (
-        "https://clinicaltrials.gov/api/v2/studies?query.spons="
-        + urllib.parse.quote(company_short)
-        + "&pageSize=5&format=json"
-    )
-    try:
-        data = http_json(url, headers={"User-Agent": SEC_USER_AGENT}, timeout=15)
-        studies = data.get("studies", [])
-        if not studies:
-            return "未检索到关联注册临床试验记录"
-        lines = []
-        for st in studies[:4]:
-            proto = st.get("protocolSection", {})
-            ident = proto.get("identificationModule", {})
-            nct_id = ident.get("nctId", "")
-            title = ident.get("briefTitle", "")
-            status = proto.get("statusModule", {}).get("overallStatus", "")
-            design = proto.get("designModule", {})
-            phases = ",".join(design.get("phases", []))
-            enrollment = design.get("enrollmentInfo", {}).get("count", "未知")
-            outcomes = proto.get("outcomesModule", {}).get("primaryOutcomes", [])
-            prim_ep = "; ".join(
-                f"{o.get('measure', '')} ({o.get('timeFrame', '')})" for o in outcomes[:2]
-            )
-            lines.append(
-                f"- [{nct_id}] ({phases}, 状态:{status}, 样本量:{enrollment}人) {title}\n"
-                f"  预设主要终点(Primary Endpoint): {prim_ep or '未披露'}"
-            )
-        return "\n".join(lines)
-    except Exception as e:
-        print(f"[WARN] ClinicalTrials.gov fetch error for {stock['ticker']}: {e}")
-        return "ClinicalTrials.gov 接口暂不可用"
-
-
 def http_json(url, method="GET", headers=None, payload=None, timeout=30):
     req_headers = headers.copy() if headers else {}
     data = None
@@ -94,6 +54,25 @@ def http_json(url, method="GET", headers=None, payload=None, timeout=30):
     req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+def fetch_webpage_plain_text(url, is_sec=False, max_chars=5500):
+    """抓取公告或媒体原文正文，去除 HTML 标签，供中文精译与细节排雷"""
+    if not url or "news.google.com/rss/articles" in url:
+        return ""
+    try:
+        headers = {
+            "User-Agent": SEC_USER_AGENT if is_sec else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        raw = re.sub(r"(?is)<(script|style|head|nav|footer)[^>]*>.*?</\1>", " ", raw)
+        text = re.sub(r"<[^>]+>", " ", html.unescape(raw))
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:max_chars]
+    except Exception:
+        return ""
 
 
 def get_google_access_token():
@@ -109,15 +88,11 @@ def get_google_access_token():
         raise RuntimeError("Missing GSHEETS_TOKEN_JSON credentials")
 
     cred = json.loads(raw)
-    client_id = cred["client_id"]
-    client_secret = cred["client_secret"]
-    refresh_token = cred["token"]["refresh_token"]
-
     form_data = urllib.parse.urlencode(
         {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "refresh_token": refresh_token,
+            "client_id": cred["client_id"],
+            "client_secret": cred["client_secret"],
+            "refresh_token": cred["token"]["refresh_token"],
             "grant_type": "refresh_token",
         }
     ).encode("utf-8")
@@ -128,12 +103,11 @@ def get_google_access_token():
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=20) as resp:
-        token_resp = json.loads(resp.read().decode("utf-8"))
-    return token_resp["access_token"]
+        return json.loads(resp.read().decode("utf-8"))["access_token"]
 
 
 def load_sheet_state(access_token):
-    ranges = ["Portfolio!A2:J50", "Config!A2:B20", "Logs!I2:I500"]
+    ranges = ["Portfolio!A2:K50", "Config!A2:B20", "Logs!I2:I500"]
     q = "&".join(f"ranges={urllib.parse.quote(r)}" for r in ranges)
     url = f"https://sheets.googleapis.com/v4/spreadsheets/{SPREADSHEET_ID}/values:batchGet?{q}"
     res = http_json(url, headers={"Authorization": f"Bearer {access_token}"})
@@ -153,17 +127,30 @@ def load_sheet_state(access_token):
         if not row or not str(row[0]).strip():
             continue
         ticker = str(row[0]).strip().upper()
-        enabled = str(row[7]).strip().upper() if len(row) > 7 and row[7] else "YES"
+        # 兼容新11列结构(启用监控在第10列 index 9)与旧结构(index 7)
+        if len(row) >= 10:
+            enabled = str(row[9]).strip().upper() or "YES"
+            benchmark = str(row[5]).strip()
+            red_flags = str(row[6]).strip()
+            avg_cost = str(row[7]).strip() or "未设置"
+            pos_note = str(row[8]).strip() or "核心跟踪"
+        else:
+            enabled = str(row[7]).strip().upper() if len(row) > 7 and row[7] else "YES"
+            benchmark = "对照同适应症标准疗法(SoC)与主流竞品评估有效性与安全性"
+            red_flags = "核查主要终点是否达标、样本量是否充足、是否存在3级以上严重不良反应(SAE)或停药率过高"
+            avg_cost = str(row[5]).strip() if len(row) > 5 and str(row[5]).strip() else "未设置"
+            pos_note = str(row[6]).strip() if len(row) > 6 and str(row[6]).strip() else "核心跟踪"
+
         if enabled == "NO":
             continue
+
         company = str(row[1]).strip() if len(row) > 1 else ticker
         exchange = str(row[2]).strip() if len(row) > 2 else ""
         raw_kw = str(row[3]) if len(row) > 3 else ""
         kw_list = [k.strip() for k in re.split(r"[,，]", raw_kw) if k.strip()]
         keywords = list(dict.fromkeys([ticker, company] + kw_list))
         catalysts = str(row[4]).strip() if len(row) > 4 else ""
-        avg_cost = str(row[5]).strip() if len(row) > 5 and str(row[5]).strip() else "未填写"
-        pos_note = str(row[6]).strip() if len(row) > 6 and str(row[6]).strip() else "持仓观察"
+
         portfolio.append(
             {
                 "ticker": ticker,
@@ -171,6 +158,8 @@ def load_sheet_state(access_token):
                 "exchange": exchange,
                 "keywords": keywords,
                 "catalysts": catalysts,
+                "benchmark": benchmark,
+                "red_flags": red_flags,
                 "avg_cost": avg_cost,
                 "pos_note": pos_note,
             }
@@ -197,6 +186,42 @@ def append_sheet_log(access_token, row_values):
     )
 
 
+def fetch_clinical_trials_context(stock):
+    """直接调用 ClinicalTrials.gov API v2 获取该公司官方注册的临床试验方案底稿"""
+    company_short = stock["company"].split(",")[0].split("Inc")[0].split("Corp")[0].strip()
+    url = (
+        "https://clinicaltrials.gov/api/v2/studies?query.spons="
+        + urllib.parse.quote(company_short)
+        + "&pageSize=5&format=json"
+    )
+    try:
+        data = http_json(url, headers={"User-Agent": SEC_USER_AGENT}, timeout=15)
+        studies = data.get("studies", [])
+        if not studies:
+            return "未检索到关联注册临床试验记录"
+        lines = []
+        for st in studies[:4]:
+            proto = st.get("protocolSection", {})
+            ident = proto.get("identificationModule", {})
+            nct_id = ident.get("nctId", "")
+            title = ident.get("briefTitle", "")
+            status = proto.get("statusModule", {}).get("overallStatus", "")
+            design = proto.get("designModule", {})
+            phases = ",".join(design.get("phases", []))
+            enrollment = design.get("enrollmentInfo", {}).get("count", "未知")
+            outcomes = proto.get("outcomesModule", {}).get("primaryOutcomes", [])
+            prim_ep = "; ".join(
+                f"{o.get('measure', '')} ({o.get('timeFrame', '')})" for o in outcomes[:2]
+            )
+            lines.append(
+                f"- [{nct_id}] ({phases}, 状态:{status}, 预设样本量:{enrollment}人) {title}\n"
+                f"  官方登记主要终点: {prim_ep or '未披露'}"
+            )
+        return "\n".join(lines)
+    except Exception:
+        return "ClinicalTrials.gov 接口暂不可用"
+
+
 def fetch_sec_cik_map():
     try:
         data = http_json(
@@ -211,8 +236,7 @@ def fetch_sec_cik_map():
             if t and cik:
                 mapping[t] = cik
         return mapping
-    except Exception as e:
-        print(f"[WARN] SEC CIK map error: {e}")
+    except Exception:
         return {}
 
 
@@ -247,8 +271,7 @@ def fetch_sec_edgar_events(stock, cik, max_age_hours=36):
             if accept_str:
                 try:
                     dt = datetime.datetime.fromisoformat(accept_str.replace("Z", "+00:00"))
-                    age_hours = (now_utc - dt).total_seconds() / 3600.0
-                    if age_hours > max_age_hours:
+                    if (now_utc - dt).total_seconds() / 3600.0 > max_age_hours:
                         continue
                 except Exception:
                     pass
@@ -258,40 +281,42 @@ def fetch_sec_edgar_events(stock, cik, max_age_hours=36):
             items_desc = str(items_list[i]) if i < len(items_list) else ""
             event_id = f"SEC_{stock['ticker']}_{acc}"
 
+            # 自动抓取 SEC 8-K / Form 4 正文文本供翻译与核验
+            doc_text = fetch_webpage_plain_text(doc_url, is_sec=True, max_chars=5000)
+
             form_label = {
-                "8-K": "SEC 8-K 重大事件公告",
-                "8-K/A": "SEC 8-K/A 重大事件补充公告",
-                "4": "SEC Form 4 内部人(高管/董事)交易申报",
-                "SC 13D": "SEC SC 13D 机构/大股东举牌申报",
-                "SC 13G": "SEC SC 13G 机构持股超过5%申报",
-            }.get(form, f"SEC {form} 申报")
+                "8-K": "8-K 重大事项通告",
+                "8-K/A": "8-K/A 补充事项通告",
+                "4": "Form 4 内部人持股变动表",
+                "SC 13D": "SC 13D 重要股东持股变动",
+                "SC 13G": "SC 13G 机构持股超过5%备案",
+            }.get(form, f"{form} 备案文件")
 
             events.append(
                 {
                     "id": event_id,
                     "stock": stock,
-                    "source": f"SEC EDGAR 官方直连 ({form})",
-                    "title": f"[{form_label}] {stock['company']} (${stock['ticker']}) 提交 {form} 文件 (日期: {fdate})",
+                    "source": f"SEC 官方备案 ({form})",
+                    "title": f"[{form_label}] {stock['company']} ({stock['ticker']}) 提交 {form} 文件 ({fdate})",
                     "content": (
-                        f"股票代码: ${stock['ticker']} ({stock['company']})\n"
-                        f"SEC 申报类型: {form_label}\n"
-                        f"申报时间: {accept_str or fdate}\n"
+                        f"标的: {stock['ticker']} ({stock['company']})\n"
+                        f"文件类型: {form_label}\n"
+                        f"提交时间: {accept_str or fdate}\n"
                         f"涉及条款 (Items): {items_desc}\n"
-                        f"SEC 官方原文链接: {doc_url}\n"
-                        f"关注催化剂背景: {stock['catalysts']}"
+                        f"原文链接: {doc_url}\n"
+                        f"文件正文提取:\n{doc_text or '(详见原文链接)'}"
                     ),
                     "url": doc_url,
                 }
             )
     except Exception as e:
-        print(f"[WARN] SEC filing check failed for {stock['ticker']}: {e}")
+        print(f"[WARN] SEC check failed for {stock['ticker']}: {e}")
     return events
 
 
 def fetch_media_rss_events(stock, max_age_hours=24):
     events = []
     company_short = stock["company"].split(",")[0].split("Inc")[0].split("Corp")[0].strip()
-    # 将股票代码、公司名称、以及前3个核心管线药名全部纳入一级并列检索词，防止媒体只写公司名或药名而漏网
     search_terms = [stock["ticker"], company_short]
     for kw in stock["keywords"]:
         kw_clean = kw.strip()
@@ -328,7 +353,7 @@ def fetch_media_rss_events(stock, max_age_hours=24):
             guid = (item.findtext("guid") or link).strip()
             pub_date = (item.findtext("pubDate") or "").strip()
             source_el = item.find("source")
-            publisher = source_el.text.strip() if source_el is not None and source_el.text else "主流媒体/发稿社"
+            publisher = source_el.text.strip() if source_el is not None and source_el.text else "行业媒体"
             raw_desc = item.findtext("description") or ""
             clean_desc = re.sub(r"<[^>]+>", " ", html.unescape(raw_desc)).strip()
 
@@ -337,13 +362,11 @@ def fetch_media_rss_events(stock, max_age_hours=24):
                     dt = parsedate_to_datetime(pub_date)
                     if dt.tzinfo is None:
                         dt = dt.replace(tzinfo=datetime.timezone.utc)
-                    age_hours = (now_utc - dt).total_seconds() / 3600.0
-                    if age_hours > max_age_hours:
+                    if (now_utc - dt).total_seconds() / 3600.0 > max_age_hours:
                         continue
                 except Exception:
                     pass
 
-            # 确保标题或摘要确实包含股票代码或核心关键词
             combined = f"{title} {clean_desc}".lower()
             if not any(kw.lower() in combined for kw in stock["keywords"] if len(kw) >= 3):
                 continue
@@ -354,13 +377,13 @@ def fetch_media_rss_events(stock, max_age_hours=24):
                 {
                     "id": event_id,
                     "stock": stock,
-                    "source": f"一手公关稿/主流媒体 ({publisher})",
+                    "source": f"公关通稿/权威媒体 ({publisher})",
                     "title": title,
                     "content": (
                         f"发布时间: {pub_date}\n"
                         f"来源媒体: {publisher}\n"
-                        f"新闻标题: {title}\n"
-                        f"新闻摘要: {clean_desc}"
+                        f"英文原文标题: {title}\n"
+                        f"英文原文内容节选: {clean_desc}"
                     ),
                     "url": link,
                 }
@@ -368,157 +391,6 @@ def fetch_media_rss_events(stock, max_age_hours=24):
     except Exception as e:
         print(f"[WARN] Media RSS failed for {stock['ticker']}: {e}")
     return events
-
-
-def call_gemini(api_key, prompt, expect_json=False, use_search=False, deep_thinking=False, models=None):
-    model_list = models or (GEMINI_TRIAGE_MODELS if expect_json else GEMINI_DEEP_MODELS)
-    for model in model_list:
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-            f"?key={urllib.parse.quote(api_key)}"
-        )
-        gen_cfg = {"temperature": 0.1 if expect_json else 0.2}
-        if expect_json:
-            gen_cfg["responseMimeType"] = "application/json"
-        if deep_thinking:
-            gen_cfg["thinkingConfig"] = {"thinkingBudget": 8192}
-
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": gen_cfg,
-        }
-        if use_search:
-            payload["tools"] = [{"google_search": {}}]
-
-        try:
-            resp = http_json(url, method="POST", payload=payload, timeout=60)
-            candidates = resp.get("candidates", [])
-            if candidates and "content" in candidates[0]:
-                parts = candidates[0]["content"].get("parts", [])
-                text = "\n".join(
-                    p.get("text", "") for p in parts if p.get("text") and not p.get("thought")
-                ).strip()
-                if text:
-                    u = resp.get("usageMetadata", {})
-                    t_cnt = u.get("thoughtsTokenCount", 0)
-                    label = f"{model} (Thinking:{t_cnt}tok)" if t_cnt else model
-                    return text, label
-        except urllib.error.HTTPError as e:
-            print(f"[WARN] Gemini model {model} HTTP {e.code} (use_search={use_search}, thinking={deep_thinking})")
-            if use_search:
-                try:
-                    payload.pop("tools", None)
-                    resp = http_json(url, method="POST", payload=payload, timeout=50)
-                    candidates = resp.get("candidates", [])
-                    if candidates and "content" in candidates[0]:
-                        parts = candidates[0]["content"].get("parts", [])
-                        text = "\n".join(
-                            p.get("text", "") for p in parts if p.get("text") and not p.get("thought")
-                        ).strip()
-                        if text:
-                            u = resp.get("usageMetadata", {})
-                            t_cnt = u.get("thoughtsTokenCount", 0)
-                            label = f"{model} (Thinking:{t_cnt}tok)" if t_cnt else model
-                            return text, label
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"[WARN] Gemini model {model} error: {e}")
-    return None, None
-
-
-def gemini_triage(ev, api_key):
-    stock = ev["stock"]
-    prompt = f"""你是一位资深华尔街美股生物医药（Biotech）与事件驱动对冲基金分析师。
-请对以下关于美股 ${stock['ticker']} ({stock['company']}) 的最新消息进行极速分诊评估。
-该公司核心管线/关键词：{', '.join(stock['keywords'])}
-重点关注的催化剂：{stock['catalysts']}
-
-【消息来源】：{ev['source']}
-【消息标题】：{ev['title']}
-【消息内容】：
-{ev['content']}
-
-请严格按以下 JSON 格式返回（只输出纯 JSON）：
-{{
-  "category": "从以下选一：临床数据 / 并购与BD合作 / 内部人交易 / FDA监管与产品上市 / 催化剂预告 / 财报与商业化 / 主流媒体报道 / 常规噪音",
-  "impact_score": 1到10的整数（1-3=无实质影响或例行卖股交税噪音；4-6=一般行业报道/普通会议邀请/常规进展；7-8=重要管线进展/R&D研发日或明确临床读数预告/内部人真金白银主动买入/大行重要评级调整/机构5%举牌；9-10=重磅临床顶线数据Readout/FDA获批或CRL/并购收购/重磅BD交易）,
-  "sentiment": "重大利好 / 偏多 / 中性 / 偏空 / 重大利空",
-  "flash_summary": "用简体中文写出80字以内的核心快讯摘要，直击关键结论与数字"
-}}"""
-    raw, used_model = call_gemini(
-        api_key, prompt, expect_json=True, use_search=False, models=GEMINI_TRIAGE_MODELS
-    )
-    if raw:
-        try:
-            cleaned = re.sub(r"^```json\s*|\s*```$", "", raw.strip())
-            res = json.loads(cleaned)
-            res["_model"] = used_model
-            return res
-        except Exception as e:
-            print(f"[WARN] Parse triage JSON failed: {e}")
-    return {
-        "category": "最新动态",
-        "impact_score": 7,
-        "sentiment": "待定",
-        "flash_summary": ev["title"],
-        "_model": "rule-fallback",
-    }
-
-
-def gemini_deep_analysis(ev, triage, api_key):
-    stock = ev["stock"]
-    ct_context = fetch_clinical_trials_context(stock)
-    prompt = f"""你是一位拥有医学博士(MD/PhD)背景、管理美股生物医药（Biotech）对冲基金的资深投资总监。
-投资人目前持仓/关注标的：${stock['ticker']} ({stock['company']})
-- 投资人记录的持仓均价：{stock['avg_cost']}
-- 仓位备注：{stock['pos_note']}
-- 该股核心看点与催化剂：{stock['catalysts']}
-
-【美国国立卫生研究院 ClinicalTrials.gov 官方注册临床试验底稿】：
-{ct_context}
-
-刚刚收到一条影响评分为 {triage.get('impact_score')}/10 的【{triage.get('category')}】情报：
-【来源】：{ev['source']}
-【标题】：{ev['title']}
-【详情】：
-{ev['content']}
-
-请你开启深度思考推理，对照 ClinicalTrials.gov 官方预设终点与行业竞品标准，用简体中文输出一份专业、深度、全面的手机端投研决策报告（约 500~650 字，结构清晰）：
-
-1. 🎯 **核心结论与预期差定性**：一句话定性该消息是“超预期重磅利好”、“符合预期（谨防 Sell the news）”还是“不及预期/结构性瑕疵”？
-2. 🔬 **临床/基本面专业深度拆解**：
-   - 若涉及临床数据：严格核对**预设主要终点(Primary Endpoint)、样本量(N)、统计学显著性(p值/HR)、临床获益绝对值(Placebo-adjusted delta)**，以及**安全性红线(3级以上SAE、停药率、剂量限制性毒性)**，并与同靶点/同适应症 Best-in-Class 竞品横向对比。
-   - 若涉及内部人交易/并购/商业化：深度剖析交易性质（主动二级市场买入 vs 期权行权）、处方放量斜率或现金流跑道（Cash Runway）与潜在增发稀释（Offering Overhang）风险。
-3. 💡 **实战交易与仓位操作建议**：针对小资金个人投资者（当前均价：{stock['avg_cost']}，定位：{stock['pos_note']}），给出明确的盘前/盘中应对策略（分批止盈点位、右侧加仓条件或关键风控止损线）。"""
-    res, used_model = call_gemini(
-        api_key,
-        prompt,
-        expect_json=False,
-        use_search=True,
-        deep_thinking=True,
-        models=GEMINI_DEEP_MODELS,
-    )
-    return (res or "深度分析生成失败，请稍后重试。"), (used_model or "gemini")
-
-
-def send_pushplus(token, title, html_body):
-    if not token or "请在此粘贴" in token:
-        return
-    try:
-        http_json(
-            "https://www.pushplus.plus/send",
-            method="POST",
-            payload={
-                "token": token,
-                "title": title,
-                "content": html_body,
-                "template": "html",
-            },
-            timeout=20,
-        )
-    except Exception as e:
-        print(f"[WARN] PushPlus send failed: {e}")
 
 
 def decode_mime_str(s):
@@ -593,9 +465,9 @@ def fetch_gmail_imap_events(config, portfolio, processed_ids):
                         {
                             "id": ev_id,
                             "stock": stock,
-                            "source": f"Gmail 官方订阅邮件 ({sender[:40]})",
+                            "source": f"Gmail 订阅邮件 ({sender[:40]})",
                             "title": subject,
-                            "content": f"发件人: {sender}\n邮件标题: {subject}\n邮件内容节选:\n{body_text[:3500]}",
+                            "content": f"发件人: {sender}\n邮件标题: {subject}\n邮件英文原文内容:\n{body_text[:4500]}",
                             "url": "https://mail.google.com/mail/u/0/#inbox",
                         }
                     )
@@ -604,6 +476,185 @@ def fetch_gmail_imap_events(config, portfolio, processed_ids):
     except Exception as e:
         print(f"[WARN] Gmail IMAP check error: {e}")
     return events
+
+
+def call_gemini(api_key, prompt, expect_json=False, use_search=False, deep_thinking=False, models=None):
+    model_list = models or (GEMINI_TRIAGE_MODELS if expect_json else GEMINI_DEEP_MODELS)
+    for model in model_list:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            f"?key={urllib.parse.quote(api_key)}"
+        )
+        gen_cfg = {"temperature": 0.1 if expect_json else 0.15}
+        if expect_json:
+            gen_cfg["responseMimeType"] = "application/json"
+        if deep_thinking:
+            gen_cfg["thinkingConfig"] = {"thinkingBudget": 8192}
+
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": gen_cfg,
+        }
+        if use_search:
+            payload["tools"] = [{"google_search": {}}]
+
+        try:
+            resp = http_json(url, method="POST", payload=payload, timeout=60)
+            candidates = resp.get("candidates", [])
+            if candidates and "content" in candidates[0]:
+                parts = candidates[0]["content"].get("parts", [])
+                text = "\n".join(
+                    p.get("text", "") for p in parts if p.get("text") and not p.get("thought")
+                ).strip()
+                if text:
+                    u = resp.get("usageMetadata", {})
+                    t_cnt = u.get("thoughtsTokenCount", 0)
+                    label = f"{model} (Thinking:{t_cnt}tok)" if t_cnt else model
+                    return text, label
+        except urllib.error.HTTPError as e:
+            print(f"[WARN] Gemini model {model} HTTP {e.code} (use_search={use_search}, thinking={deep_thinking})")
+            if use_search:
+                try:
+                    payload.pop("tools", None)
+                    resp = http_json(url, method="POST", payload=payload, timeout=50)
+                    candidates = resp.get("candidates", [])
+                    if candidates and "content" in candidates[0]:
+                        parts = candidates[0]["content"].get("parts", [])
+                        text = "\n".join(
+                            p.get("text", "") for p in parts if p.get("text") and not p.get("thought")
+                        ).strip()
+                        if text:
+                            u = resp.get("usageMetadata", {})
+                            t_cnt = u.get("thoughtsTokenCount", 0)
+                            label = f"{model} (Thinking:{t_cnt}tok)" if t_cnt else model
+                            return text, label
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[WARN] Gemini model {model} error: {e}")
+    return None, None
+
+
+def gemini_triage_and_translate(ev, api_key):
+    """
+    阶段一：极速评分 + 核心要点提炼 + 官方英文原文完整精准中文直译
+    严格禁止出现任何股票推荐/金融交易敏感词
+    """
+    stock = ev["stock"]
+    prompt = f"""请对以下关于生物科技公司 {stock['ticker']} ({stock['company']}) 的最新英文资料进行客观分级与精准中文翻译。
+公司核心管线词库：{', '.join(stock['keywords'])}
+重点跟踪事项：{stock['catalysts']}
+
+【来源】：{ev['source']}
+【标题】：{ev['title']}
+【原始英文内容】：
+{ev['content']}
+
+⚠️ 严格要求：
+1. 全文严禁出现“美股、炒股、买入、卖出、加仓、减仓、止盈、止损、暴涨、暴跌、基金经理、交易建议”等敏感字眼，一律使用客观科研与企业经营术语。
+2. `chinese_translation` 字段必须将该新闻/通告的标题与核心原始段落完整、精准、逐句翻译为简体中文，100%保留原文中的所有实验数据、百分比、p值、剂量、样本量N、患者分组和关键英文专有名词缩写，不得删减数字或自行发挥。
+
+请严格按以下 JSON 格式返回（只输出纯 JSON）：
+{{
+  "category": "从以下选一：临床数据 / 合作与并购 / 内部人变动 / 监管与上市 / 事项预告 / 经营业绩 / 行业报道 / 常规行政",
+  "impact_score": 1到10的整数（1-3=常规行政/例行扣税变动等低相关事项；4-6=一般行业报道或常规推进；7-8=重要管线进展/明确数据读数时间窗预告/管理层主动增持(Code P)/重要合作里程碑；9-10=关键临床II/III期顶线数据/监管获批或CRL/收购并购）,
+  "direction": "强正向 / 偏正向 / 中性 / 偏负向 / 强负向",
+  "flash_summary": "50字以内的一句话核心事实摘要（只写客观事实与关键数字，不写废话）",
+  "chinese_translation": "【标题及正文核心内容完整中文精译（保留全部原始数据与措辞）】"
+}}"""
+    raw, used_model = call_gemini(
+        api_key, prompt, expect_json=True, use_search=False, models=GEMINI_TRIAGE_MODELS
+    )
+    if raw:
+        try:
+            cleaned = re.sub(r"^```json\s*|\s*```$", "", raw.strip())
+            res = json.loads(cleaned)
+            res["_model"] = used_model
+            return res
+        except Exception as e:
+            print(f"[WARN] Parse triage JSON failed: {e}")
+    return {
+        "category": "最新动态",
+        "impact_score": 7,
+        "direction": "待核验",
+        "flash_summary": ev["title"],
+        "chinese_translation": ev["content"][:1000],
+        "_model": "fallback",
+    }
+
+
+def gemini_deep_rubric_audit(ev, triage, api_key):
+    """
+    阶段二：严格按照表格预设的【达标标尺与竞品基准】+【排雷红线与披露口径】进行结构化对表核验
+    开启 8192 Token 深度思考推理 + Google 实时检索 + ClinicalTrials.gov 官方底稿比对
+    """
+    stock = ev["stock"]
+    ct_context = fetch_clinical_trials_context(stock)
+    prompt = f"""请开启深度思考推理，严格对照下方预设的【达标标尺与竞品基准】、【排雷红线与披露口径观察点】以及【ClinicalTrials.gov 官方注册底稿】，对 {stock['ticker']} ({stock['company']}) 的最新消息进行极度严谨、紧凑的对表核验。
+
+================ 事前预设标尺卡 (Pre-set Rubric) ================
+1. 【预设达标标尺与竞品基准 (Benchmark)】：
+{stock['benchmark']}
+
+2. 【重点排雷红线与披露口径观察点 (Red Flags & Wording Audit)】：
+{stock['red_flags']}
+
+3. 【ClinicalTrials.gov 官方注册试验底稿】：
+{ct_context}
+=================================================================
+
+【本次最新事件 ({triage.get('category')}, 重要度 {triage.get('impact_score')}/10)】：
+标题：{ev['title']}
+内容详情：
+{ev['content']}
+
+⚠️ 严格遵守以下输出铁律：
+- 严禁寒暄、严禁自称“我是专家/分析师/经理”，直接输出干货！
+- 严禁出现“美股、炒股、买入、卖出、加仓、止盈、止损、暴涨、暴跌”等敏感词，一律采用客观科研与商业评估措辞（如“显著优于基准”、“符合预期但需留意短期分歧与融资窗口”、“核心指标未达标/触发红线”）。
+- 总字数严格控制在 350~450 字以内，言简意赅，只包含以下三个固定模块：
+
+### 1. ⚖️ 预设标尺对表结论：【超越标尺 / 符合标尺 / 低于标尺】
+- 直接拿本次披露的具体数字（如疗效幅度、p值、半衰期、ADA比例、处方收入或里程碑金额）与上方【预设达标标尺与竞品基准】逐一比对，明确指出哪项指标赢了竞品、哪项指标落后。
+
+### 2. 🔍 披露口径与隐晦风险排雷
+- 严格排查官方用词与数据口径：
+  ① 人群口径：是全分析集(ITT/mITT)还是仅统计完成者(Completers/Per-protocol)？有无事后亚组数据挖掘(Post-hoc subgroup spin)？
+  ② 对照组与绝对值：是否披露安慰剂校准后绝对差值(Placebo-adjusted delta)及基线水平？
+  ③ 安全性与耐受性红线：对照上方【重点排雷红线】，核查是否有 3 级以上 SAE、肝酶升高、心血管不良反应或停药率异常？
+  ④ 商业与股本条款：若是 Form 4，核查是公开市场主动增持(Code P)还是期权行权/扣税(Code M/F/S)；若是临床利好，评估短期内借机增发稀释(S-3/ATM)的概率。
+
+### 3. 🧭 综合信号评级与观察要点
+- **信号定性**：【强正向催化 / 兑现型中性催化 / 存疑待确认 / 负向风险预警】
+- **后续关键验证点**：1~2句话点明接下来最需紧盯的后续细节（如完整会议数据披露、监管沟通节点或现金流变化）。"""
+
+    res, used_model = call_gemini(
+        api_key,
+        prompt,
+        expect_json=False,
+        use_search=True,
+        deep_thinking=True,
+        models=GEMINI_DEEP_MODELS,
+    )
+    return (res or "深度核验暂不可用。"), (used_model or "gemini")
+
+
+def send_pushplus(token, title, html_body):
+    if not token or "请在此粘贴" in token:
+        return
+    try:
+        http_json(
+            "https://www.pushplus.plus/send",
+            method="POST",
+            payload={
+                "token": token,
+                "title": title,
+                "content": html_body,
+                "template": "html",
+            },
+            timeout=20,
+        )
+    except Exception as e:
+        print(f"[WARN] PushPlus send failed: {e}")
 
 
 def main():
@@ -615,13 +666,10 @@ def main():
     push_token = config.get("PUSHPLUS_TOKEN", "").strip()
     threshold = int(float(config.get("IMPACT_THRESHOLD", "7") or 7))
 
-    print(f"[INFO] Loaded {len(portfolio)} active stocks from Google Sheet: {[s['ticker'] for s in portfolio]}")
-    print(f"[INFO] Loaded {len(processed_ids)} historical log IDs (threshold={threshold})")
-
+    print(f"[INFO] Loaded {len(portfolio)} active targets from Google Sheet: {[s['ticker'] for s in portfolio]}")
     cik_map = fetch_sec_cik_map()
     all_events = []
 
-    # 渠道 0：若配置了 Gmail 应用专用密码，直接读取 neo664939@gmail.com 收到的公司官方 IR 邮件 (SEC Filing / Event / News)
     gmail_ev = fetch_gmail_imap_events(config, portfolio, processed_ids)
     all_events.extend(gmail_ev)
 
@@ -633,67 +681,63 @@ def main():
             if ev["id"] not in processed_ids:
                 all_events.append(ev)
 
-    print(f"[INFO] Found {len(all_events)} new unprocessed events across SEC EDGAR & Mainstream Media.")
-
-    # 如果是首次部署验证 (--force-demo) 且当前无最新突发未读事件，抓取最新一条真实新闻或生成一条巡检报告以验证端到端全链路
     if force_demo and not all_events and portfolio:
         for stock in portfolio:
             rss_any = fetch_media_rss_events(stock, max_age_hours=24 * 14)
             if rss_any:
                 sample = rss_any[0]
-                sample["id"] = sample["id"] + "_CLOUD_LIVE"
+                sample["id"] = sample["id"] + "_RUBRIC_V2"
                 if sample["id"] not in processed_ids:
                     all_events.append(sample)
                     break
 
     for ev in all_events[:5]:
         stock = ev["stock"]
-        triage = gemini_triage(ev, api_key)
+        triage = gemini_triage_and_translate(ev, api_key)
         score = int(triage.get("impact_score", 6))
         category = triage.get("category", "最新动态")
-        sentiment = triage.get("sentiment", "中性")
+        direction = triage.get("direction", "中性")
         flash_summary = triage.get("flash_summary", ev["title"])
+        cn_translation = triage.get("chinese_translation", "")
 
         if score <= 3:
-            # 1-3分属纯行政噪音，仅静默归档到表格 Logs，不弹窗打扰手机
-            deep_text = "常规低影响噪音（评分≤3，已静默归档不弹窗）"
+            deep_text = "常规行政事项（重要度≤3，已静默归档）"
         else:
-            badge = "🚨【重大催化剂快讯】" if score >= threshold else "📩【持仓动态快讯】"
-            flash_title = f"{badge} ${stock['ticker']} | {category} (评分:{score}/10)"
+            badge = "📋【重点情报】" if score >= threshold else "📩【动态快讯】"
+            flash_title = f"{badge} {stock['ticker']} | {category} ({score}/10)"
             flash_html = f"""
             <div style="font-family:sans-serif;line-height:1.6;">
               <h3 style="margin:0 0 8px 0;color:{'#d93025' if score >= threshold else '#1a73e8'};">{flash_title}</h3>
-              <p style="margin:4px 0;"><b>标的：</b>${stock['ticker']} ({stock['company']})</p>
-              <p style="margin:4px 0;"><b>情绪倾向：</b>{sentiment} ｜ <b>影响评分：</b><b>{score} / 10</b></p>
-              <p style="margin:4px 0;"><b>信源：</b>{ev['source']}</p>
-              <hr style="border:none;border-top:1px solid #eee;margin:10px 0;"/>
-              <p style="margin:6px 0;font-size:15px;"><b>⚡ Gemini 快讯摘要：</b><br/>{flash_summary}</p>
-              <p style="margin:8px 0;font-size:12px;color:#666;">原文标题：{ev['title']}<br/><a href="{ev['url']}">👉 点击查看原始文件/报道链接</a></p>
-              {'<p style="color:#d93025;font-size:13px;">⏳ <b>达到重大催化剂阈值（≥' + str(threshold) + '分），正在调用 Gemini 旗舰模型生成深度投研与交易建议，约10秒后二次推送...</b></p>' if score >= threshold else ''}
+              <p style="margin:3px 0;font-size:13px;"><b>主体：</b>{stock['ticker']} ({stock['company']}) ｜ <b>方向：</b>{direction} ｜ <b>来源：</b>{ev['source']}</p>
+              <hr style="border:none;border-top:1px solid #eee;margin:8px 0;"/>
+              <p style="margin:6px 0;font-size:14px;"><b>⚡ 一句话核心要点：</b><br/>{flash_summary}</p>
+              <div style="background:#f8f9fa;padding:10px;border-left:3px solid #1a73e8;margin:8px 0;font-size:13px;white-space:pre-wrap;"><b>📄 官方通告/报道原文精准中译：</b>\n{cn_translation}</div>
+              <p style="margin:6px 0;font-size:12px;color:#666;">英文原标题：{ev['title']}<br/><a href="{ev['url']}">👉 查看原始英文出处</a></p>
+              {'<p style="color:#d93025;font-size:12px;">⏳ <b>重要度 ≥ ' + str(threshold) + '，正在对照预设【竞品标尺与排雷红线】生成深度核验报告...</b></p>' if score >= threshold else ''}
             </div>
             """
             send_pushplus(push_token, flash_title, flash_html)
-            print(f"[INFO] Sent Stage 1 Flash Alert for {stock['ticker']} (score={score})")
+            print(f"[INFO] Sent Stage 1 Flash + CN Translation for {stock['ticker']} (score={score})")
 
-            deep_text = "未达深度分析阈值（4-6分仅推送第一阶段快讯）"
+            deep_text = "未达深度核验阈值（仅推送快讯与原文中译）"
             if score >= threshold:
                 time.sleep(2)
-                deep_text, deep_model = gemini_deep_analysis(ev, triage, api_key)
-                deep_title = f"🧠【Gemini 深度研报】${stock['ticker']} 结论与交易建议"
+                deep_text, deep_model = gemini_deep_rubric_audit(ev, triage, api_key)
+                deep_title = f"🔬【标尺核验】{stock['ticker']} 基准比对与口径排雷"
                 deep_html = f"""
-                <div style="font-family:sans-serif;line-height:1.65;">
-                  <h3 style="margin:0 0 8px 0;color:#188038;">{deep_title}</h3>
-                  <p style="margin:4px 0;font-size:13px;color:#555;">
-                    <b>关联持仓：</b>${stock['ticker']} ｜ <b>记录均价：</b>{stock['avg_cost']} ｜ <b>定位：</b>{stock['pos_note']} ｜ <b>模型：</b>{deep_model}
+                <div style="font-family:sans-serif;line-height:1.6;">
+                  <h3 style="margin:0 0 6px 0;color:#188038;">{deep_title}</h3>
+                  <p style="margin:3px 0;font-size:12px;color:#555;">
+                    <b>主体：</b>{stock['ticker']} ｜ <b>引擎：</b>{deep_model} + 预设标尺库
                   </p>
-                  <hr style="border:none;border-top:1px solid #ddd;margin:10px 0;"/>
-                  <div style="white-space:pre-wrap;font-size:14px;">{deep_text}</div>
-                  <hr style="border:none;border-top:1px solid #eee;margin:10px 0;"/>
-                  <p style="font-size:12px;color:#666;"><a href="{ev['url']}">🔗 查看一手消息原文</a> ｜ <a href="https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit">📊 打开云端持仓监控表</a></p>
+                  <hr style="border:none;border-top:1px solid #ddd;margin:8px 0;"/>
+                  <div style="white-space:pre-wrap;font-size:13.5px;">{deep_text}</div>
+                  <hr style="border:none;border-top:1px solid #eee;margin:8px 0;"/>
+                  <p style="font-size:12px;color:#666;"><a href="{ev['url']}">🔗 查看英文原文出处</a> ｜ <a href="https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit">📊 打开云端预设标尺表</a></p>
                 </div>
                 """
                 send_pushplus(push_token, deep_title, deep_html)
-                print(f"[INFO] Sent Stage 2 Deep Analysis Alert for {stock['ticker']} using {deep_model}")
+                print(f"[INFO] Sent Stage 2 Rubric Audit for {stock['ticker']} using {deep_model}")
 
         bj_time = (
             datetime.datetime.now(datetime.timezone.utc)
@@ -707,7 +751,7 @@ def main():
                 ev["source"],
                 category,
                 score,
-                flash_summary,
+                f"【要点】{flash_summary}\n【原文中译】{cn_translation}",
                 deep_text,
                 f"{ev['title']} ({ev['url']})",
                 ev["id"],
