@@ -13,8 +13,12 @@
 
 import base64
 import datetime
+import email
+from email.header import decode_header
+from email.utils import parsedate_to_datetime
 import hashlib
 import html
+import imaplib
 import json
 import os
 import re
@@ -30,11 +34,19 @@ SPREADSHEET_ID = os.environ.get(
     "SPREADSHEET_ID", "1pIKfEy9UNPs32W5gBFJu3N5doqU-SKCvIBDjX-TMwGQ"
 )
 SEC_USER_AGENT = "AntigravityStockMonitor/1.0 (neo664939@gmail.com)"
-GEMINI_MODELS = [
-    "gemini-3-flash-preview",
+GEMINI_TRIAGE_MODELS = [
     "gemini-3.5-flash",
     "gemini-3.6-flash",
+    "gemini-3-flash-preview",
     "gemini-3.1-flash-lite-preview",
+]
+
+GEMINI_DEEP_MODELS = [
+    "gemini-4-argon",
+    "gemini-3.1-pro-preview",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3-flash-preview",
 ]
 
 
@@ -244,8 +256,17 @@ def fetch_sec_edgar_events(stock, cik, max_age_hours=36):
 def fetch_media_rss_events(stock, max_age_hours=24):
     events = []
     company_short = stock["company"].split(",")[0].split("Inc")[0].split("Corp")[0].strip()
+    # 将股票代码、公司名称、以及前3个核心管线药名全部纳入一级并列检索词，防止媒体只写公司名或药名而漏网
+    search_terms = [stock["ticker"], company_short]
+    for kw in stock["keywords"]:
+        kw_clean = kw.strip()
+        if kw_clean and kw_clean not in search_terms and len(kw_clean) >= 4:
+            search_terms.append(kw_clean)
+        if len(search_terms) >= 5:
+            break
+    or_clause = " OR ".join(f'"{t}"' for t in search_terms)
     query = (
-        f'("{stock["ticker"]}" OR "{company_short}") '
+        f"({or_clause}) "
         f"(site:globenewswire.com OR site:prnewswire.com OR site:businesswire.com "
         f"OR site:statnews.com OR site:fiercebiotech.com OR site:fiercepharma.com "
         f"OR site:biopharmadive.com OR site:endpointsnews.com OR site:reuters.com "
@@ -314,8 +335,9 @@ def fetch_media_rss_events(stock, max_age_hours=24):
     return events
 
 
-def call_gemini(api_key, prompt, expect_json=False, use_search=False):
-    for model in GEMINI_MODELS:
+def call_gemini(api_key, prompt, expect_json=False, use_search=False, models=None):
+    model_list = models or (GEMINI_TRIAGE_MODELS if expect_json else GEMINI_DEEP_MODELS)
+    for model in model_list:
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
             f"?key={urllib.parse.quote(api_key)}"
@@ -336,11 +358,10 @@ def call_gemini(api_key, prompt, expect_json=False, use_search=False):
                 parts = candidates[0]["content"].get("parts", [])
                 text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
                 if text:
-                    return text
+                    return text, model
         except urllib.error.HTTPError as e:
             print(f"[WARN] Gemini model {model} HTTP {e.code} (use_search={use_search})")
             if use_search:
-                # 某些免费模型不支持同时开启 google_search，尝试无 search 兜底
                 try:
                     payload.pop("tools", None)
                     resp = http_json(url, method="POST", payload=payload, timeout=40)
@@ -349,12 +370,12 @@ def call_gemini(api_key, prompt, expect_json=False, use_search=False):
                         parts = candidates[0]["content"].get("parts", [])
                         text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
                         if text:
-                            return text
+                            return text, model
                 except Exception:
                     pass
         except Exception as e:
             print(f"[WARN] Gemini model {model} error: {e}")
-    return None
+    return None, None
 
 
 def gemini_triage(ev, api_key):
@@ -372,15 +393,19 @@ def gemini_triage(ev, api_key):
 请严格按以下 JSON 格式返回（只输出纯 JSON）：
 {{
   "category": "从以下选一：临床数据 / 并购与BD合作 / 内部人交易 / FDA监管与产品上市 / 催化剂预告 / 财报与商业化 / 主流媒体报道 / 常规噪音",
-  "impact_score": 1到10的整数（1-3=无实质影响或例行卖股交税噪音；4-6=一般行业报道或常规进展；7-8=重要管线进展/内部人真金白银主动买入/大行重要评级调整/重要催化剂预告；9-10=重磅临床顶线数据Readout/FDA获批或CRL/并购收购/重磅BD交易）,
+  "impact_score": 1到10的整数（1-3=无实质影响或例行卖股交税噪音；4-6=一般行业报道/普通会议邀请/常规进展；7-8=重要管线进展/R&D研发日或明确临床读数预告/内部人真金白银主动买入/大行重要评级调整/机构5%举牌；9-10=重磅临床顶线数据Readout/FDA获批或CRL/并购收购/重磅BD交易）,
   "sentiment": "重大利好 / 偏多 / 中性 / 偏空 / 重大利空",
   "flash_summary": "用简体中文写出80字以内的核心快讯摘要，直击关键结论与数字"
 }}"""
-    raw = call_gemini(api_key, prompt, expect_json=True, use_search=False)
+    raw, used_model = call_gemini(
+        api_key, prompt, expect_json=True, use_search=False, models=GEMINI_TRIAGE_MODELS
+    )
     if raw:
         try:
             cleaned = re.sub(r"^```json\s*|\s*```$", "", raw.strip())
-            return json.loads(cleaned)
+            res = json.loads(cleaned)
+            res["_model"] = used_model
+            return res
         except Exception as e:
             print(f"[WARN] Parse triage JSON failed: {e}")
     return {
@@ -388,6 +413,7 @@ def gemini_triage(ev, api_key):
         "impact_score": 7,
         "sentiment": "待定",
         "flash_summary": ev["title"],
+        "_model": "rule-fallback",
     }
 
 
@@ -410,8 +436,10 @@ def gemini_deep_analysis(ev, triage, api_key):
 1. 🎯 **核心结论与预期差定性**：一句话定性该消息是“超预期利好”、“符合预期（谨防 Sell the news）”还是“不及预期/潜在风险”？
 2. 🔬 **基本面与催化剂拆解**：结合公司核心管线（{', '.join(stock['keywords'][:5])}）分析本次事件对股价的核心驱动逻辑或潜在风险点。
 3. 💡 **实战交易与仓位建议**：针对小资金个人投资者（当前均价：{stock['avg_cost']}，定位：{stock['pos_note']}），给出明确的盘前/盘中应对参考（如分批止盈、持有观察或风控止损位）。"""
-    res = call_gemini(api_key, prompt, expect_json=False, use_search=True)
-    return res or "深度分析生成失败，请稍后重试。"
+    res, used_model = call_gemini(
+        api_key, prompt, expect_json=False, use_search=True, models=GEMINI_DEEP_MODELS
+    )
+    return (res or "深度分析生成失败，请稍后重试。"), (used_model or "gemini")
 
 
 def send_pushplus(token, title, html_body):
@@ -433,6 +461,91 @@ def send_pushplus(token, title, html_body):
         print(f"[WARN] PushPlus send failed: {e}")
 
 
+def decode_mime_str(s):
+    if not s:
+        return ""
+    parts = decode_header(s)
+    out = []
+    for content, enc in parts:
+        if isinstance(content, bytes):
+            out.append(content.decode(enc or "utf-8", errors="replace"))
+        else:
+            out.append(str(content))
+    return "".join(out)
+
+
+def fetch_gmail_imap_events(config, portfolio, processed_ids):
+    events = []
+    app_pwd = config.get("GMAIL_APP_PASSWORD", "").replace(" ", "").strip()
+    gmail_user = config.get("GMAIL_ADDRESS", "neo664939@gmail.com").strip() or "neo664939@gmail.com"
+    if not app_pwd or "可选" in app_pwd or "请" in app_pwd:
+        return events
+
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+        mail.login(gmail_user, app_pwd)
+        mail.select("INBOX")
+        since_date = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)).strftime("%d-%b-%Y")
+        status, data = mail.search(None, f'(UNSEEN SINCE "{since_date}")')
+        if status != "OK" or not data or not data[0]:
+            mail.logout()
+            return events
+
+        msg_nums = data[0].split()[-25:]
+        for num in reversed(msg_nums):
+            st, msg_data = mail.fetch(num, "(RFC822)")
+            if st != "OK" or not msg_data or not msg_data[0]:
+                continue
+            raw_email = msg_data[0][1]
+            msg = email.message_from_bytes(raw_email)
+            msg_id_hdr = (msg.get("Message-ID") or str(num)).strip()
+            ev_id = "GMAIL_" + hashlib.sha1(msg_id_hdr.encode("utf-8")).hexdigest()[:16]
+            if ev_id in processed_ids:
+                continue
+
+            subject = decode_mime_str(msg.get("Subject", "(无标题)")).strip()
+            sender = decode_mime_str(msg.get("From", "")).strip()
+            body_text = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    ctype = part.get_content_type()
+                    if ctype == "text/plain" and "attachment" not in str(part.get("Content-Disposition", "")):
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            body_text += payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+            else:
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    body_text = payload.decode(msg.get_content_charset() or "utf-8", errors="replace")
+
+            if not body_text and msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/html":
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            raw_html = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+                            body_text = re.sub(r"<[^>]+>", " ", html.unescape(raw_html))
+
+            combined = f"{subject}\n{sender}\n{body_text}".lower()
+            for stock in portfolio:
+                if any(kw.lower() in combined for kw in stock["keywords"] if len(kw) >= 3):
+                    events.append(
+                        {
+                            "id": ev_id,
+                            "stock": stock,
+                            "source": f"Gmail 官方订阅邮件 ({sender[:40]})",
+                            "title": subject,
+                            "content": f"发件人: {sender}\n邮件标题: {subject}\n邮件内容节选:\n{body_text[:3500]}",
+                            "url": "https://mail.google.com/mail/u/0/#inbox",
+                        }
+                    )
+                    break
+        mail.logout()
+    except Exception as e:
+        print(f"[WARN] Gmail IMAP check error: {e}")
+    return events
+
+
 def main():
     force_demo = "--force-demo" in sys.argv
     access_token = get_google_access_token()
@@ -447,6 +560,10 @@ def main():
 
     cik_map = fetch_sec_cik_map()
     all_events = []
+
+    # 渠道 0：若配置了 Gmail 应用专用密码，直接读取 neo664939@gmail.com 收到的公司官方 IR 邮件 (SEC Filing / Event / News)
+    gmail_ev = fetch_gmail_imap_events(config, portfolio, processed_ids)
+    all_events.extend(gmail_ev)
 
     for stock in portfolio:
         cik = cik_map.get(stock["ticker"])
@@ -477,42 +594,46 @@ def main():
         sentiment = triage.get("sentiment", "中性")
         flash_summary = triage.get("flash_summary", ev["title"])
 
-        badge = "🚨【重大催化剂快讯】" if score >= threshold else "📩【持仓动态快讯】"
-        flash_title = f"{badge} ${stock['ticker']} | {category} (评分:{score}/10)"
-        flash_html = f"""
-        <div style="font-family:sans-serif;line-height:1.6;">
-          <h3 style="margin:0 0 8px 0;color:{'#d93025' if score >= threshold else '#1a73e8'};">{flash_title}</h3>
-          <p style="margin:4px 0;"><b>标的：</b>${stock['ticker']} ({stock['company']})</p>
-          <p style="margin:4px 0;"><b>情绪倾向：</b>{sentiment} ｜ <b>影响评分：</b><b>{score} / 10</b></p>
-          <p style="margin:4px 0;"><b>信源：</b>{ev['source']}</p>
-          <hr style="border:none;border-top:1px solid #eee;margin:10px 0;"/>
-          <p style="margin:6px 0;font-size:15px;"><b>⚡ Gemini 快讯摘要：</b><br/>{flash_summary}</p>
-          <p style="margin:8px 0;font-size:12px;color:#666;">原文标题：{ev['title']}<br/><a href="{ev['url']}">👉 点击查看原始文件/报道链接</a></p>
-          {'<p style="color:#d93025;font-size:13px;">⏳ <b>达到重大催化剂阈值（≥' + str(threshold) + '分），正在调用 Gemini + 联网检索生成深度投研与交易建议，约10秒后二次推送...</b></p>' if score >= threshold else ''}
-        </div>
-        """
-        send_pushplus(push_token, flash_title, flash_html)
-        print(f"[INFO] Sent Stage 1 Flash Alert for {stock['ticker']} (score={score})")
-
-        deep_text = "未达深度分析阈值（仅快讯通知）"
-        if score >= threshold:
-            time.sleep(2)
-            deep_text = gemini_deep_analysis(ev, triage, api_key)
-            deep_title = f"🧠【Gemini 深度研报】${stock['ticker']} 结论与交易建议"
-            deep_html = f"""
-            <div style="font-family:sans-serif;line-height:1.65;">
-              <h3 style="margin:0 0 8px 0;color:#188038;">{deep_title}</h3>
-              <p style="margin:4px 0;font-size:13px;color:#555;">
-                <b>关联持仓：</b>${stock['ticker']} ｜ <b>记录均价：</b>{stock['avg_cost']} ｜ <b>定位：</b>{stock['pos_note']}
-              </p>
-              <hr style="border:none;border-top:1px solid #ddd;margin:10px 0;"/>
-              <div style="white-space:pre-wrap;font-size:14px;">{deep_text}</div>
+        if score <= 3:
+            # 1-3分属纯行政噪音，仅静默归档到表格 Logs，不弹窗打扰手机
+            deep_text = "常规低影响噪音（评分≤3，已静默归档不弹窗）"
+        else:
+            badge = "🚨【重大催化剂快讯】" if score >= threshold else "📩【持仓动态快讯】"
+            flash_title = f"{badge} ${stock['ticker']} | {category} (评分:{score}/10)"
+            flash_html = f"""
+            <div style="font-family:sans-serif;line-height:1.6;">
+              <h3 style="margin:0 0 8px 0;color:{'#d93025' if score >= threshold else '#1a73e8'};">{flash_title}</h3>
+              <p style="margin:4px 0;"><b>标的：</b>${stock['ticker']} ({stock['company']})</p>
+              <p style="margin:4px 0;"><b>情绪倾向：</b>{sentiment} ｜ <b>影响评分：</b><b>{score} / 10</b></p>
+              <p style="margin:4px 0;"><b>信源：</b>{ev['source']}</p>
               <hr style="border:none;border-top:1px solid #eee;margin:10px 0;"/>
-              <p style="font-size:12px;color:#666;"><a href="{ev['url']}">🔗 查看一手消息原文</a> ｜ <a href="https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit">📊 打开云端持仓监控表</a></p>
+              <p style="margin:6px 0;font-size:15px;"><b>⚡ Gemini 快讯摘要：</b><br/>{flash_summary}</p>
+              <p style="margin:8px 0;font-size:12px;color:#666;">原文标题：{ev['title']}<br/><a href="{ev['url']}">👉 点击查看原始文件/报道链接</a></p>
+              {'<p style="color:#d93025;font-size:13px;">⏳ <b>达到重大催化剂阈值（≥' + str(threshold) + '分），正在调用 Gemini 旗舰模型生成深度投研与交易建议，约10秒后二次推送...</b></p>' if score >= threshold else ''}
             </div>
             """
-            send_pushplus(push_token, deep_title, deep_html)
-            print(f"[INFO] Sent Stage 2 Deep Analysis Alert for {stock['ticker']}")
+            send_pushplus(push_token, flash_title, flash_html)
+            print(f"[INFO] Sent Stage 1 Flash Alert for {stock['ticker']} (score={score})")
+
+            deep_text = "未达深度分析阈值（4-6分仅推送第一阶段快讯）"
+            if score >= threshold:
+                time.sleep(2)
+                deep_text, deep_model = gemini_deep_analysis(ev, triage, api_key)
+                deep_title = f"🧠【Gemini 深度研报】${stock['ticker']} 结论与交易建议"
+                deep_html = f"""
+                <div style="font-family:sans-serif;line-height:1.65;">
+                  <h3 style="margin:0 0 8px 0;color:#188038;">{deep_title}</h3>
+                  <p style="margin:4px 0;font-size:13px;color:#555;">
+                    <b>关联持仓：</b>${stock['ticker']} ｜ <b>记录均价：</b>{stock['avg_cost']} ｜ <b>定位：</b>{stock['pos_note']} ｜ <b>模型：</b>{deep_model}
+                  </p>
+                  <hr style="border:none;border-top:1px solid #ddd;margin:10px 0;"/>
+                  <div style="white-space:pre-wrap;font-size:14px;">{deep_text}</div>
+                  <hr style="border:none;border-top:1px solid #eee;margin:10px 0;"/>
+                  <p style="font-size:12px;color:#666;"><a href="{ev['url']}">🔗 查看一手消息原文</a> ｜ <a href="https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit">📊 打开云端持仓监控表</a></p>
+                </div>
+                """
+                send_pushplus(push_token, deep_title, deep_html)
+                print(f"[INFO] Sent Stage 2 Deep Analysis Alert for {stock['ticker']} using {deep_model}")
 
         bj_time = (
             datetime.datetime.now(datetime.timezone.utc)
