@@ -1,0 +1,102 @@
+{
+  "root": {
+    "id": "182XirR1PicM8j0m1cvVAAWDNl0U_2HAg",
+    "name": "美股生物医药投研库 (Biotech Research Vault)",
+    "webViewLink": "https://drive.google.com/drive/folders/182XirR1PicM8j0m1cvVAAWDNl0U_2HAg"
+  },
+  "sync_folder": {
+    "id": "1x-3gF5g8ceE3Z8oulNKBuMEyNHfGxAtF",
+    "name": "00_网站与催化剂底稿同步 (Claude_Artifact_Sync)",
+    "webViewLink": "https://drive.google.com/drive/folders/1x-3gF5g8ceE3Z8oulNKBuMEyNHfGxAtF"
+  },
+  "stocks": {
+    "ABSI": {
+      "folder": {
+        "id": "1hlR3iGUEUyg_XGXOTf8tGHdNXBbEBZS2",
+        "name": "ABSI_Absci",
+        "webViewLink": "https://drive.google.com/drive/folders/1hlR3iGUEUyg_XGXOTf8tGHdNXBbEBZS2"
+      },
+      "internal": {
+        "id": "142Lcae_wj_cfsUxXe8BW8J5I123ZTcgP",
+        "name": "01_公司内部官方口径 (Deck_Transcript_SEC)",
+        "webViewLink": "https://drive.google.com/drive/folders/142Lcae_wj_cfsUxXe8BW8J5I123ZTcgP"
+      },
+      "external": {
+        "id": "1r4ZSC9q0Odndn8DKzUrrEktOTzZgPhYA",
+        "name": "02_外部投行与独立研报 (SellSide_Consensus)",
+        "webViewLink": "https://drive.google.com/drive/folders/1r4ZSC9q0Odndn8DKzUrrEktOTzZgPhYA"
+      },
+      "bilingual": {
+        "id": "1VbjKn69YtCHAYH05Epuz3DNVsiL6pt_K",
+        "name": "03_中英对照译文与解析 (Bilingual_Output)",
+        "webViewLink": "https://drive.google.com/drive/folders/1VbjKn69YtCHAYH05Epuz3DNVsiL6pt_K"
+      }
+    },
+    "ARWR": {
+      "folder": {
+        "id": "1ZsM-vWNqtxrlYHpqJN_BNb8x5WMFMsp0",
+        "name": "ARWR_Arrowhead",
+        "webViewLink": "https://drive.google.com/drive/folders/1ZsM-vWNqtxrlYHpqJN_BNb8x5WMFMsp0"
+      },
+      "internal": {
+        "id": "18l7CPc9wc9h-260n5uEqzhWcR87BGDNI",
+        "name": "01_公司内部官方口径 (Deck_Transcript_SEC)",
+        "webViewLink": "https://drive.google.com/drive/folders/18l7CPc9wc9h-260n5uEqzhWcR87BGDNI"
+      },
+      "external": {
+        "id": "1ThZ_uJQoMMv4_Su3j2tKpZ0BVsaSfF_E",
+        "name": "02_外部投行与独立研报 (SellSide_Consensus)",
+        "webViewLink": "https://drive.google.com/drive/folders/1ThZ_uJQoMMv4_Su3j2tKpZ0BVsaSfF_E"
+      },
+      "bilingual": {
+        "id": "1_dgRw3v2w6LgsqZrrN4twh00_I4HKEv9",
+        "name": "03_中英对照译文与解析 (Bilingual_Output)",
+        "webViewLink": "https://drive.google.com/drive/folders/1_dgRw3v2w6LgsqZrrN4twh00_I4HKEv9"
+      }
+    },
+    "KRYS": {
+      "folder": {
+        "id": "17dfpfIslLjdQXSCPWE9j3sYTkxdznAD9",
+        "name": "KRYS_Krystal",
+        "webViewLink": "https://drive.google.com/drive/folders/17dfpfIslLjdQXSCPWE9j3sYTkxdznAD9"
+      },
+      "internal": {
+        "id": "1424s8jY16FRaeWEp4WXl9N6Wd5quzDVx",
+        "name": "01_公司内部官方口径 (Deck_Transcript_SEC)",
+        "webViewLink": "https://drive.google.com/drive/folders/1424s8jY16FRaeWEp4WXl9N6Wd5quzDVx"
+      },
+      "external": {
+        "id": "1_5ASngeC32HPbzeuX-A3K7EmjAoVXxiZ",
+        "name": "02_外部投行与独立研报 (SellSide_Consensus)",
+        "webViewLink": "https://drive.google.com/drive/folders/1_5ASngeC32HPbzeuX-A3K7EmjAoVXxiZ"
+      },
+      "bilingual": {
+        "id": "15xeGhLRd8N1AT2oy__OtvUR94jmW_iM8",
+        "name": "03_中英对照译文与解析 (Bilingual_Output)",
+        "webViewLink": "https://drive.google.com/drive/folders/15xeGhLRd8N1AT2oy__OtvUR94jmW_iM8"
+      }
+    },
+    "MANE": {
+      "folder": {
+        "id": "1DZwFOFjCJYr9ers9Q1nrTYRXBZGPP_-X",
+        "name": "MANE_Veradermics",
+        "webViewLink": "https://drive.google.com/drive/folders/1DZwFOFjCJYr9ers9Q1nrTYRXBZGPP_-X"
+      },
+      "internal": {
+        "id": "1B9kEYHpqlVvBT1WmD68tmZXyYnAnU--g",
+        "name": "01_公司内部官方口径 (Deck_Transcript_SEC)",
+        "webViewLink": "https://drive.google.com/drive/folders/1B9kEYHpqlVvBT1WmD68tmZXyYnAnU--g"
+      },
+      "external": {
+        "id": "194waR4OjgxvbUfw7Ahd9pCCrfX3H-pUK",
+        "name": "02_外部投行与独立研报 (SellSide_Consensus)",
+        "webViewLink": "https://drive.google.com/drive/folders/194waR4OjgxvbUfw7Ahd9pCCrfX3H-pUK"
+      },
+      "bilingual": {
+        "id": "1oAHz2v8QZBR__b3ntUm5E71cmJgDACzs",
+        "name": "03_中英对照译文与解析 (Bilingual_Output)",
+        "webViewLink": "https://drive.google.com/drive/folders/1oAHz2v8QZBR__b3ntUm5E71cmJgDACzs"
+      }
+    }
+  }
+}

@@ -8,7 +8,7 @@ on:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -18,7 +18,10 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Run SEC EDGAR & Mainstream Media Catalyst Monitor
+      - name: Install lightweight PDF splitter
+        run: pip install --quiet pypdf
+
+      - name: Run SEC EDGAR, Gmail, Media & Google Drive Research Vault Sync
         env:
           GSHEETS_TOKEN_JSON: ${{ secrets.GSHEETS_TOKEN_JSON }}
           SPREADSHEET_ID: '1pIKfEy9UNPs32W5gBFJu3N5doqU-SKCvIBDjX-TMwGQ'

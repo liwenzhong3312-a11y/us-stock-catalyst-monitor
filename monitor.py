@@ -487,41 +487,67 @@ def fetch_gmail_imap_events(config, portfolio, processed_ids):
     return events
 
 
+_GEMINI_KEY_IDX = 0
+
+
+def parse_api_keys(raw_key_str):
+    if not raw_key_str:
+        return []
+    keys = [
+        k.strip()
+        for k in re.split(r"[,，;\n\r\s]+", str(raw_key_str))
+        if k.strip() and not k.strip().startswith("请")
+    ]
+    return list(dict.fromkeys(keys))
+
+
 def call_gemini(api_key, prompt, expect_json=False, use_search=False, deep_thinking=False, models=None):
+    global _GEMINI_KEY_IDX
+    keys = parse_api_keys(api_key) if isinstance(api_key, str) else list(api_key)
+    if not keys:
+        return None, None
     model_list = models or (GEMINI_TRIAGE_MODELS if expect_json else GEMINI_DEEP_MODELS)
     for model in model_list:
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-            f"?key={urllib.parse.quote(api_key)}"
-        )
-        gen_cfg = {"temperature": 0.1 if expect_json else 0.15}
-        if expect_json:
-            gen_cfg["responseMimeType"] = "application/json"
-        if deep_thinking:
-            gen_cfg["thinkingConfig"] = {"thinkingBudget": 8192}
+        for attempt in range(len(keys)):
+            cur_key = keys[(_GEMINI_KEY_IDX + attempt) % len(keys)]
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+                f"?key={urllib.parse.quote(cur_key)}"
+            )
+            gen_cfg = {"temperature": 0.1 if expect_json else 0.15}
+            if expect_json:
+                gen_cfg["responseMimeType"] = "application/json"
+            if deep_thinking:
+                gen_cfg["thinkingConfig"] = {"thinkingBudget": 8192}
 
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": gen_cfg,
-        }
-        if use_search:
-            payload["tools"] = [{"google_search": {}}]
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": gen_cfg,
+            }
+            if use_search:
+                payload["tools"] = [{"google_search": {}}]
 
-        try:
-            resp = http_json(url, method="POST", payload=payload, timeout=60)
-            candidates = resp.get("candidates", [])
-            if candidates and "content" in candidates[0]:
-                parts = candidates[0]["content"].get("parts", [])
-                text = "\n".join(
-                    p.get("text", "") for p in parts if p.get("text") and not p.get("thought")
-                ).strip()
-                if text:
-                    u = resp.get("usageMetadata", {})
-                    t_cnt = u.get("thoughtsTokenCount", 0)
-                    label = f"{model} (Thinking:{t_cnt}tok)" if t_cnt else model
-                    return text, label
-        except Exception as e:
-            print(f"[WARN] Gemini model {model} error: {e}")
+            try:
+                resp = http_json(url, method="POST", payload=payload, timeout=60)
+                _GEMINI_KEY_IDX = (_GEMINI_KEY_IDX + attempt + 1) % len(keys)
+                candidates = resp.get("candidates", [])
+                if candidates and "content" in candidates[0]:
+                    parts = candidates[0]["content"].get("parts", [])
+                    text = "\n".join(
+                        p.get("text", "") for p in parts if p.get("text") and not p.get("thought")
+                    ).strip()
+                    if text:
+                        u = resp.get("usageMetadata", {})
+                        t_cnt = u.get("thoughtsTokenCount", 0)
+                        label = f"{model} (Thinking:{t_cnt}tok)" if t_cnt else model
+                        return text, label
+            except urllib.error.HTTPError as e:
+                print(f"[WARN] Gemini key#{attempt+1} model {model} HTTP {e.code}: {e}")
+                if e.code == 429:
+                    time.sleep(1.5)
+                    continue
+            except Exception as e:
+                print(f"[WARN] Gemini key#{attempt+1} model {model} error: {e}")
     return None, None
 
 
@@ -573,18 +599,24 @@ def gemini_translate_facts(ev, api_key):
     }
 
 
-def gemini_deep_analysis(ev, facts, api_key):
+def gemini_deep_analysis(ev, facts, api_key, vault_notes=None):
     """
-    阶段二：基于真实公告原文与通用生物医药专业分析准则的深度解读
-    重点涵盖：1. 核心数据与官方原文披露的下一阶段催化剂节点；2. 竞争格局横向比对；3. 官方披露用词口径与隐晦风险挖掘
+    阶段二：基于真实公告原文、ClinicalTrials.gov 官方底稿、以及 Google Drive 投研库（内部 Deck/Transcript 口径 vs 外部投行研报预期共识 vs 自建网站催化剂底稿）的深度解读
     """
     stock = ev["stock"]
     ct_context = fetch_clinical_trials_context(stock)
-    prompt = f"""请开启深度思考推理，基于以下 {stock['ticker']} ({stock['company']}) 刚刚发布的真实通告内容与 ClinicalTrials.gov 官方临床试验注册底稿，进行客观、深度的生物医药专业拆解。
+    vault_block = ""
+    if vault_notes:
+        joined_notes = "\n\n".join(vault_notes[-6:])
+        vault_block = f"""
+【Google Drive 投研库已归档的内外口径与网站催化剂底稿（内部官方 Deck/Transcript vs 外部投行预期共识）】：
+{joined_notes}
+"""
+    prompt = f"""请开启深度思考推理，基于以下 {stock['ticker']} ({stock['company']}) 刚刚发布的真实通告内容、ClinicalTrials.gov 官方临床试验注册底稿{ '以及投研库归档的内外口径底稿' if vault_block else '' }，进行客观、深度的生物医药专业拆解。
 
 【ClinicalTrials.gov 官方注册试验底稿】：
 {ct_context}
-
+{vault_block}
 【本次通告英文原标题】：{ev['title']}
 【本次通告中文翻译标题】：{facts.get('title_cn')}
 【本次通告原文内容】：
@@ -593,15 +625,16 @@ def gemini_deep_analysis(ev, facts, api_key):
 ⚠️ 严格遵守以下专业分析准则与输出铁律：
 - 严禁寒暄、严禁自称“专家/分析师/经理”，严禁出现“美股、炒股、买入、卖出、加仓、止盈、止损、暴涨、暴跌”等敏感词。
 - 必须严格依据通告原文事实进行分析，原文未披露的数据请明确指出“原文未披露”，绝不臆测。
-- 总字数控制在 350~450 字以内，只输出以下三个模块：
+- 总字数控制在 350~480 字以内，只输出以下三个模块：
 
 ### 1. 🎯 核心事实与官方披露的后续催化剂节点
 - **核心结论**：提炼本次通告最关键的数据指标（如主要/次要终点结果、p值、样本量、交易金额或持股变动性质）。
 - **官方预告的下一催化剂**：严格从通告原文中提取公司官方明确提到的下一步计划与时间窗口（例如：何时在医学大会公布完整数据、何时向 FDA 提交 NDA/IND、何时完成入组或启动下一阶段试验；若原文未提及具体时间点，则写“通告原文未披露具体下一时间节点”）。
 
-### 2. 🔍 披露用词口径与隐晦风险审视
-- 结合公司披露的措辞与口径挖掘潜在细节：
-  • 若为临床进展：审视其统计口径（是全人群 ITT 还是仅完成者 Completers？是否只给定性描述如“positive trend/well-tolerated”却隐瞒具体安慰剂对照组绝对差值、p值或3级以上不良反应/停药率？对照上方 ClinicalTrials.gov 登记终点看有无偏离？）。
+### 2. 🔍 内外口径比对、用词审视与隐晦风险挖掘
+- **内外口径对照与预期差**：若上方【投研库底稿】中包含公司历史 Deck/电话会承诺或外部投行预期共识（Beat/Miss 标准），请明确对比本次结果是否兑现了管理层此前承诺、是否达到外部投行预期基准。
+- **措辞与细节审视**：
+  • 若为临床进展：审视其统计口径（全人群 ITT 还是仅完成者 Completers？是否只给定性描述如“positive trend/well-tolerated”却隐瞒安慰剂对照组绝对差值、p值或3级以上不良反应/停药率？对照 ClinicalTrials.gov 登记终点看有无偏离？）。
   • 若为内部人变动/财务通告：核查是公开市场主动增持(Code P)还是期权行权/例行扣税(Code M/F/S)；评估临床利好发布后短期内伴随增发融资(S-3/ATM)的潜在稀释风险。
 
 ### 3. ⚔️ 竞争格局比对与综合信号定性
@@ -647,6 +680,17 @@ def main():
     threshold = int(float(config.get("IMPACT_THRESHOLD", "7") or 7))
 
     print(f"[INFO] Loaded {len(portfolio)} active targets from Google Sheet: {[s['ticker'] for s in portfolio]}")
+
+    # 同步 Google Drive 投研库（内部 Deck/Transcript vs 外部投行研报 vs 网站催化剂底稿）并生成中英对照 PDF
+    vault_knowledge = {}
+    try:
+        from vault_sync import sync_drive_vault
+        vault_knowledge = sync_drive_vault(
+            access_token, config, portfolio, send_pushplus_fn=send_pushplus
+        )
+    except Exception as e:
+        print(f"[WARN] Drive vault sync skipped or failed: {e}")
+
     cik_map = fetch_sec_cik_map()
     all_events = []
 
@@ -702,13 +746,17 @@ def main():
             deep_text = "未达深度解读阈值（仅推送基础事实与原文翻译）"
             if score >= threshold:
                 time.sleep(2)
-                deep_text, deep_model = gemini_deep_analysis(ev, facts, api_key)
+                stock_vault_notes = vault_knowledge.get(stock["ticker"], [])
+                deep_text, deep_model = gemini_deep_analysis(
+                    ev, facts, api_key, vault_notes=stock_vault_notes
+                )
+                vault_badge = " + 投研库内外口径比对" if stock_vault_notes else ""
                 deep_title = f"🔬【深度解读】{stock['ticker']} | {category} ({score}/10)"
                 deep_html = f"""
                 <div style="font-family:sans-serif;line-height:1.65;">
                   <p style="margin:0 0 6px 0;font-size:12px;color:#555;">
                     <b>关联事件：</b>{html.escape(title_cn)}<br/>
-                    <b>推理引擎：</b>{deep_model} + ClinicalTrials.gov 官方试验库
+                    <b>推理引擎：</b>{deep_model} + ClinicalTrials.gov 官方试验库{vault_badge}
                   </p>
                   <hr style="border:none;border-top:1px solid #ddd;margin:8px 0;"/>
                   <div style="white-space:pre-wrap;font-size:13.5px;">{deep_text}</div>
