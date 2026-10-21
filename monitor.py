@@ -631,7 +631,7 @@ def gemini_deep_rubric_audit(ev, triage, api_key):
         api_key,
         prompt,
         expect_json=False,
-        use_search=True,
+        use_search=False,
         deep_thinking=True,
         models=GEMINI_DEEP_MODELS,
     )
