@@ -24,6 +24,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
+import zipfile
 
 SPREADSHEET_ID = os.environ.get(
     "SPREADSHEET_ID", "1pIKfEy9UNPs32W5gBFJu3N5doqU-SKCvIBDjX-TMwGQ"
@@ -149,11 +151,77 @@ def list_folder_files(access_token, folder_id):
     return res.get("files", [])
 
 
+def extract_docx_text(docx_bytes):
+    """内置 .docx (ZIP+XML) 解析器：无需第三方库即可提取 Word 中的所有段落与表格文字"""
+    try:
+        with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zf:
+            if "word/document.xml" not in zf.namelist():
+                return ""
+            xml_bytes = zf.read("word/document.xml")
+        root = ET.fromstring(xml_bytes)
+        lines = []
+        for elem in root.iter():
+            tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+            if tag == "p":
+                texts = [
+                    t.text
+                    for t in elem.iter()
+                    if (t.tag.endswith("}t") or t.tag == "t") and t.text
+                ]
+                if texts:
+                    lines.append("".join(texts))
+        return "\n\n".join(lines)
+    except Exception:
+        return ""
+
+
+def convert_office_file_to_pdf_bytes(access_token, file_meta):
+    """
+    利用 Google Drive 官方转换引擎，将用户上传的 Word (.docx/.doc) 或 PPT (.pptx/.ppt)
+    临时转换为 Google Doc/Slides 并导出为原生 PDF 二进制流（保留全部表格与图片），用完即焚。
+    """
+    file_id = file_meta["id"]
+    fname = file_meta.get("name", "").lower()
+    mime = file_meta.get("mimeType", "").lower()
+    target_g_mime = (
+        "application/vnd.google-apps.presentation"
+        if ("presentation" in mime or fname.endswith((".ppt", ".pptx")))
+        else "application/vnd.google-apps.document"
+    )
+    copy_url = f"https://www.googleapis.com/drive/v3/files/{file_id}/copy?fields=id"
+    copy_info = http_json(
+        copy_url,
+        method="POST",
+        headers={"Authorization": f"Bearer {access_token}"},
+        payload={"name": f"_temp_office_conv_{file_id}", "mimeType": target_g_mime},
+    )
+    temp_id = copy_info["id"]
+    try:
+        export_url = f"https://www.googleapis.com/drive/v3/files/{temp_id}/export?mimeType=application/pdf"
+        req_exp = urllib.request.Request(
+            export_url, headers={"Authorization": f"Bearer {access_token}"}
+        )
+        with urllib.request.urlopen(req_exp, timeout=60) as resp:
+            return resp.read()
+    finally:
+        try:
+            del_req = urllib.request.Request(
+                f"https://www.googleapis.com/drive/v3/files/{temp_id}",
+                headers={"Authorization": f"Bearer {access_token}"},
+                method="DELETE",
+            )
+            urllib.request.urlopen(del_req, timeout=20).close()
+        except Exception:
+            pass
+
+
 def download_drive_file_bytes(access_token, file_meta):
     file_id = file_meta["id"]
     mime = file_meta.get("mimeType", "")
     if mime == "application/vnd.google-apps.document":
-        url = f"https://www.googleapis.com/drive/v3/files/{file_id}/export?mimeType=text/plain"
+        url = f"https://www.googleapis.com/drive/v3/files/{file_id}/export?mimeType=application/pdf"
+    elif mime == "application/vnd.google-apps.presentation":
+        url = f"https://www.googleapis.com/drive/v3/files/{file_id}/export?mimeType=application/pdf"
     elif mime == "application/vnd.google-apps.spreadsheet":
         url = f"https://www.googleapis.com/drive/v3/files/{file_id}/export?mimeType=text/csv"
     else:
@@ -524,7 +592,11 @@ def sync_drive_vault(access_token, config, portfolio, send_pushplus_fn=None):
             continue
         try:
             raw_bytes = download_drive_file_bytes(access_token, fmeta)
-            raw_text = raw_bytes.decode("utf-8", errors="replace")
+            fname_low = fmeta["name"].lower()
+            if fname_low.endswith(".docx"):
+                raw_text = extract_docx_text(raw_bytes) or raw_bytes.decode("utf-8", errors="replace")
+            else:
+                raw_text = raw_bytes.decode("utf-8", errors="replace")
             parsed = parse_claude_artifact_or_text(
                 api_keys, fmeta["name"], raw_text, portfolio
             )
@@ -605,12 +677,43 @@ def sync_drive_vault(access_token, config, portfolio, send_pushplus_fn=None):
                 mime = fmeta.get("mimeType", "")
                 print(f"[INFO] Translating & indexing new vault file for {ticker} ({role_label}): {fname}")
                 try:
-                    raw_bytes = download_drive_file_bytes(access_token, fmeta)
-                    if "pdf" in mime.lower() or fname.lower().endswith(".pdf"):
+                    fname_low = fname.lower()
+                    mime_low = mime.lower()
+                    is_pdf = (
+                        "pdf" in mime_low
+                        or fname_low.endswith(".pdf")
+                        or mime_low in ("application/vnd.google-apps.document", "application/vnd.google-apps.presentation")
+                    )
+                    is_office = (
+                        fname_low.endswith((".docx", ".doc", ".pptx", ".ppt"))
+                        or "wordprocessingml" in mime_low
+                        or "msword" in mime_low
+                        or "presentationml" in mime_low
+                        or "powerpoint" in mime_low
+                    )
+
+                    if is_pdf:
+                        raw_bytes = download_drive_file_bytes(access_token, fmeta)
                         summary, bilingual_md = translate_and_extract_pdf(
                             api_keys, stock, role_label, fname, raw_bytes
                         )
+                    elif is_office:
+                        try:
+                            pdf_bytes = convert_office_file_to_pdf_bytes(access_token, fmeta)
+                            summary, bilingual_md = translate_and_extract_pdf(
+                                api_keys, stock, role_label, fname, pdf_bytes
+                            )
+                        except Exception as conv_err:
+                            print(f"[WARN] Office-to-PDF conversion fallback for {fname}: {conv_err}")
+                            raw_bytes = download_drive_file_bytes(access_token, fmeta)
+                            text_content = extract_docx_text(raw_bytes) or raw_bytes.decode("utf-8", errors="replace")
+                            prompt = f"""请将以下 {ticker} ({stock['company']}) 的【{role_label}】文档（{fname}）逐段翻译为中英对照格式，并在开头提炼 300 字以内的核心要点（区分内部承诺或外部投行预期阈值）：\n\n{text_content[:25000]}"""
+                            bilingual_md, _ = call_gemini_with_rotation(
+                                api_keys, prompt, expect_json=False, deep_thinking=True
+                            )
+                            summary = (bilingual_md or "")[:400]
                     else:
+                        raw_bytes = download_drive_file_bytes(access_token, fmeta)
                         text_content = raw_bytes.decode("utf-8", errors="replace")
                         prompt = f"""请将以下 {ticker} ({stock['company']}) 的【{role_label}】文档（{fname}）逐段翻译为中英对照格式，并在开头提炼 300 字以内的核心要点（区分内部承诺或外部投行预期阈值）：\n\n{text_content[:25000]}"""
                         bilingual_md, _ = call_gemini_with_rotation(
