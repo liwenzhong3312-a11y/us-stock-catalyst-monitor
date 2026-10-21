@@ -42,12 +42,47 @@ GEMINI_TRIAGE_MODELS = [
 ]
 
 GEMINI_DEEP_MODELS = [
-    "gemini-4-argon",
-    "gemini-3.1-pro-preview",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
     "gemini-3-flash-preview",
 ]
+
+
+def fetch_clinical_trials_context(stock):
+    """直接调用美国国立卫生研究院 ClinicalTrials.gov API v2 获取该公司核心管线的真实临床试验设计(NCT编号/入组人数/预设主要终点)"""
+    company_short = stock["company"].split(",")[0].split("Inc")[0].split("Corp")[0].strip()
+    url = (
+        "https://clinicaltrials.gov/api/v2/studies?query.spons="
+        + urllib.parse.quote(company_short)
+        + "&pageSize=5&format=json"
+    )
+    try:
+        data = http_json(url, headers={"User-Agent": SEC_USER_AGENT}, timeout=15)
+        studies = data.get("studies", [])
+        if not studies:
+            return "未检索到关联注册临床试验记录"
+        lines = []
+        for st in studies[:4]:
+            proto = st.get("protocolSection", {})
+            ident = proto.get("identificationModule", {})
+            nct_id = ident.get("nctId", "")
+            title = ident.get("briefTitle", "")
+            status = proto.get("statusModule", {}).get("overallStatus", "")
+            design = proto.get("designModule", {})
+            phases = ",".join(design.get("phases", []))
+            enrollment = design.get("enrollmentInfo", {}).get("count", "未知")
+            outcomes = proto.get("outcomesModule", {}).get("primaryOutcomes", [])
+            prim_ep = "; ".join(
+                f"{o.get('measure', '')} ({o.get('timeFrame', '')})" for o in outcomes[:2]
+            )
+            lines.append(
+                f"- [{nct_id}] ({phases}, 状态:{status}, 样本量:{enrollment}人) {title}\n"
+                f"  预设主要终点(Primary Endpoint): {prim_ep or '未披露'}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"[WARN] ClinicalTrials.gov fetch error for {stock['ticker']}: {e}")
+        return "ClinicalTrials.gov 接口暂不可用"
 
 
 def http_json(url, method="GET", headers=None, payload=None, timeout=30):
@@ -335,42 +370,56 @@ def fetch_media_rss_events(stock, max_age_hours=24):
     return events
 
 
-def call_gemini(api_key, prompt, expect_json=False, use_search=False, models=None):
+def call_gemini(api_key, prompt, expect_json=False, use_search=False, deep_thinking=False, models=None):
     model_list = models or (GEMINI_TRIAGE_MODELS if expect_json else GEMINI_DEEP_MODELS)
     for model in model_list:
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
             f"?key={urllib.parse.quote(api_key)}"
         )
+        gen_cfg = {"temperature": 0.1 if expect_json else 0.2}
+        if expect_json:
+            gen_cfg["responseMimeType"] = "application/json"
+        if deep_thinking:
+            gen_cfg["thinkingConfig"] = {"thinkingBudget": 8192}
+
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.1 if expect_json else 0.2},
+            "generationConfig": gen_cfg,
         }
-        if expect_json:
-            payload["generationConfig"]["responseMimeType"] = "application/json"
         if use_search:
             payload["tools"] = [{"google_search": {}}]
 
         try:
-            resp = http_json(url, method="POST", payload=payload, timeout=45)
+            resp = http_json(url, method="POST", payload=payload, timeout=60)
             candidates = resp.get("candidates", [])
             if candidates and "content" in candidates[0]:
                 parts = candidates[0]["content"].get("parts", [])
-                text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+                text = "\n".join(
+                    p.get("text", "") for p in parts if p.get("text") and not p.get("thought")
+                ).strip()
                 if text:
-                    return text, model
+                    u = resp.get("usageMetadata", {})
+                    t_cnt = u.get("thoughtsTokenCount", 0)
+                    label = f"{model} (Thinking:{t_cnt}tok)" if t_cnt else model
+                    return text, label
         except urllib.error.HTTPError as e:
-            print(f"[WARN] Gemini model {model} HTTP {e.code} (use_search={use_search})")
+            print(f"[WARN] Gemini model {model} HTTP {e.code} (use_search={use_search}, thinking={deep_thinking})")
             if use_search:
                 try:
                     payload.pop("tools", None)
-                    resp = http_json(url, method="POST", payload=payload, timeout=40)
+                    resp = http_json(url, method="POST", payload=payload, timeout=50)
                     candidates = resp.get("candidates", [])
                     if candidates and "content" in candidates[0]:
                         parts = candidates[0]["content"].get("parts", [])
-                        text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+                        text = "\n".join(
+                            p.get("text", "") for p in parts if p.get("text") and not p.get("thought")
+                        ).strip()
                         if text:
-                            return text, model
+                            u = resp.get("usageMetadata", {})
+                            t_cnt = u.get("thoughtsTokenCount", 0)
+                            label = f"{model} (Thinking:{t_cnt}tok)" if t_cnt else model
+                            return text, label
                 except Exception:
                     pass
         except Exception as e:
@@ -419,11 +468,15 @@ def gemini_triage(ev, api_key):
 
 def gemini_deep_analysis(ev, triage, api_key):
     stock = ev["stock"]
-    prompt = f"""你是一位管理美股生物医药（Biotech）专户的资深基金经理。
+    ct_context = fetch_clinical_trials_context(stock)
+    prompt = f"""你是一位拥有医学博士(MD/PhD)背景、管理美股生物医药（Biotech）对冲基金的资深投资总监。
 投资人目前持仓/关注标的：${stock['ticker']} ({stock['company']})
 - 投资人记录的持仓均价：{stock['avg_cost']}
 - 仓位备注：{stock['pos_note']}
 - 该股核心看点与催化剂：{stock['catalysts']}
+
+【美国国立卫生研究院 ClinicalTrials.gov 官方注册临床试验底稿】：
+{ct_context}
 
 刚刚收到一条影响评分为 {triage.get('impact_score')}/10 的【{triage.get('category')}】情报：
 【来源】：{ev['source']}
@@ -431,13 +484,20 @@ def gemini_deep_analysis(ev, triage, api_key):
 【详情】：
 {ev['content']}
 
-请你结合实时检索与行业背景，用简体中文输出一份简明犀利、直接指导实战的手机端深度分析报告（控制在 450 字以内，分段清晰）：
+请你开启深度思考推理，对照 ClinicalTrials.gov 官方预设终点与行业竞品标准，用简体中文输出一份专业、深度、全面的手机端投研决策报告（约 500~650 字，结构清晰）：
 
-1. 🎯 **核心结论与预期差定性**：一句话定性该消息是“超预期利好”、“符合预期（谨防 Sell the news）”还是“不及预期/潜在风险”？
-2. 🔬 **基本面与催化剂拆解**：结合公司核心管线（{', '.join(stock['keywords'][:5])}）分析本次事件对股价的核心驱动逻辑或潜在风险点。
-3. 💡 **实战交易与仓位建议**：针对小资金个人投资者（当前均价：{stock['avg_cost']}，定位：{stock['pos_note']}），给出明确的盘前/盘中应对参考（如分批止盈、持有观察或风控止损位）。"""
+1. 🎯 **核心结论与预期差定性**：一句话定性该消息是“超预期重磅利好”、“符合预期（谨防 Sell the news）”还是“不及预期/结构性瑕疵”？
+2. 🔬 **临床/基本面专业深度拆解**：
+   - 若涉及临床数据：严格核对**预设主要终点(Primary Endpoint)、样本量(N)、统计学显著性(p值/HR)、临床获益绝对值(Placebo-adjusted delta)**，以及**安全性红线(3级以上SAE、停药率、剂量限制性毒性)**，并与同靶点/同适应症 Best-in-Class 竞品横向对比。
+   - 若涉及内部人交易/并购/商业化：深度剖析交易性质（主动二级市场买入 vs 期权行权）、处方放量斜率或现金流跑道（Cash Runway）与潜在增发稀释（Offering Overhang）风险。
+3. 💡 **实战交易与仓位操作建议**：针对小资金个人投资者（当前均价：{stock['avg_cost']}，定位：{stock['pos_note']}），给出明确的盘前/盘中应对策略（分批止盈点位、右侧加仓条件或关键风控止损线）。"""
     res, used_model = call_gemini(
-        api_key, prompt, expect_json=False, use_search=True, models=GEMINI_DEEP_MODELS
+        api_key,
+        prompt,
+        expect_json=False,
+        use_search=True,
+        deep_thinking=True,
+        models=GEMINI_DEEP_MODELS,
     )
     return (res or "深度分析生成失败，请稍后重试。"), (used_model or "gemini")
 
