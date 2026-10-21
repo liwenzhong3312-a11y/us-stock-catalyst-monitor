@@ -681,15 +681,18 @@ def main():
 
     print(f"[INFO] Loaded {len(portfolio)} active targets from Google Sheet: {[s['ticker'] for s in portfolio]}")
 
-    # 同步 Google Drive 投研库（内部 Deck/Transcript vs 外部投行研报 vs 网站催化剂底稿）并生成中英对照 PDF
+    # 读取 Google Sheet 的 Vault 投研知识库（由对话直译入库或按需触发同步，日常巡检零额外耗时）
     vault_knowledge = {}
     try:
-        from vault_sync import sync_drive_vault
-        vault_knowledge = sync_drive_vault(
-            access_token, config, portfolio, send_pushplus_fn=send_pushplus
-        )
+        from vault_sync import load_vault_sheet_records, sync_drive_vault
+        if os.environ.get("SYNC_DRIVE_VAULT", "0") == "1":
+            vault_knowledge = sync_drive_vault(
+                access_token, config, portfolio, send_pushplus_fn=send_pushplus
+            )
+        else:
+            _, vault_knowledge = load_vault_sheet_records(access_token)
     except Exception as e:
-        print(f"[WARN] Drive vault sync skipped or failed: {e}")
+        print(f"[WARN] Vault records load skipped or failed: {e}")
 
     cik_map = fetch_sec_cik_map()
     all_events = []
