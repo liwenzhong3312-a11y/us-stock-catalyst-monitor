@@ -650,7 +650,7 @@ def sync_drive_vault(access_token, config, portfolio, send_pushplus_fn=None):
                         push_token,
                         f"📚【网站底稿已同步】{tk_up} | {base_name[:22]}",
                         f"<p>已自动解析您上传的网站/催化剂底稿 <b>{html.escape(fmeta['name'])}</b> 并注入实时监控比对库：</p>"
-                        f"<div style='background:#fef7e0;padding:10px;border-radius:4px;white-space:pre-wrap;'>{html.escape(tk_note)}</div>"
+                        f"<div style='border-left:3px solid #fbbc04;padding-left:10px;margin:10px 0;white-space:pre-wrap;'>{html.escape(tk_note)}</div>"
                         f"<p><a href='{pdf_link}'>📄 点击打开/下载中英对照 PDF</a></p>",
                     )
             processed_vault_ids.add(v_id)
@@ -760,7 +760,7 @@ def sync_drive_vault(access_token, config, portfolio, send_pushplus_fn=None):
                             push_token,
                             f"📚【中英对照PDF已生成】{ticker} | {base_name[:20]}",
                             f"<p><b>标的：</b>{ticker} ({stock['company']})<br/><b>口径分类：</b>{role_label}<br/><b>原始文件：</b>{html.escape(fname)}</p>"
-                            f"<div style='background:#fef7e0;padding:10px;border-radius:4px;white-space:pre-wrap;font-size:13px;'><b>【核心结构化提炼】</b>\n{html.escape(summary)}</div>"
+                            f"<div style='border-left:3px solid #fbbc04;padding-left:10px;margin:10px 0;white-space:pre-wrap;font-size:14px;'><b>【核心结构化提炼】</b>\n{html.escape(summary)}</div>"
                             f"<p style='margin-top:10px;'><a href='{pdf_link}'>👉 点击打开/下载中英对照 PDF</a></p>",
                         )
                     processed_vault_ids.add(v_id)

@@ -723,22 +723,24 @@ def main():
         if score <= 3:
             deep_text = "常规低相关事项（重要度≤3，已静默归档）"
         else:
-            # 第一条推送：严格只发【基础事实：英文原标题 + 中文翻译标题 + 中文翻译正文】
+            # 第一条推送：严格只发【基础事实：英文原标题 + 中文翻译标题 + 中文翻译正文】（自适应微信深色/浅色模式，不设浅色背景块）
             badge = "📋【基础事实】"
             fact_push_title = f"{badge} {stock['ticker']} | { title_cn[:28] }"
             fact_html = f"""
-            <div style="font-family:sans-serif;line-height:1.65;">
-              <p style="margin:0 0 6px 0;font-size:13px;color:#555;">
-                <b>标的：</b>{stock['ticker']} ({stock['company']}) ｜ <b>分类：</b>{category} ｜ <b>重要度：</b><b>{score}/10</b>
+            <div style="font-family:sans-serif;line-height:1.7;font-size:14px;">
+              <p style="margin:0 0 8px 0;">
+                <b>标的：</b>{stock['ticker']} ({stock['company']}) ｜ <b>分类：</b>{category} ｜ <b>重要度：{score}/10</b>
               </p>
-              <div style="background:#f1f3f4;padding:8px 10px;border-radius:4px;margin:6px 0;font-size:13px;">
+              <div style="border-left:3px solid #888;padding-left:10px;margin:10px 0;">
                 <b>【英文原标题】</b><br/>{html.escape(ev['title'])}
               </div>
-              <div style="background:#e8f0fe;padding:8px 10px;border-radius:4px;margin:6px 0;font-size:14px;color:#174ea6;">
+              <div style="border-left:3px solid #3b82f6;padding-left:10px;margin:10px 0;font-size:15px;">
                 <b>【中文翻译标题】</b><br/><b>{html.escape(title_cn)}</b>
               </div>
-              <div style="background:#ffffff;padding:10px;border:1px solid #e0e0e0;border-radius:4px;margin:8px 0;font-size:13.5px;white-space:pre-wrap;"><b>【中文翻译正文】</b>\n{html.escape(body_cn)}</div>
-              <p style="margin:6px 0;font-size:12px;color:#666;">
+              <hr style="border:none;border-top:1px solid #555;margin:10px 0;"/>
+              <div style="margin:10px 0;font-size:14px;white-space:pre-wrap;"><b>【中文翻译正文】</b>\n{html.escape(body_cn)}</div>
+              <hr style="border:none;border-top:1px solid #555;margin:10px 0;"/>
+              <p style="margin:6px 0;font-size:13px;">
                 来源：{html.escape(ev['source'])} ｜ <a href="{ev['url']}">👉 点击查看英文原文出处</a>
               </p>
             </div>
@@ -756,15 +758,15 @@ def main():
                 vault_badge = " + 投研库内外口径比对" if stock_vault_notes else ""
                 deep_title = f"🔬【深度解读】{stock['ticker']} | {category} ({score}/10)"
                 deep_html = f"""
-                <div style="font-family:sans-serif;line-height:1.65;">
-                  <p style="margin:0 0 6px 0;font-size:12px;color:#555;">
+                <div style="font-family:sans-serif;line-height:1.7;font-size:14px;">
+                  <p style="margin:0 0 8px 0;font-size:13px;">
                     <b>关联事件：</b>{html.escape(title_cn)}<br/>
                     <b>推理引擎：</b>{deep_model} + ClinicalTrials.gov 官方试验库{vault_badge}
                   </p>
-                  <hr style="border:none;border-top:1px solid #ddd;margin:8px 0;"/>
-                  <div style="white-space:pre-wrap;font-size:13.5px;">{deep_text}</div>
-                  <hr style="border:none;border-top:1px solid #eee;margin:8px 0;"/>
-                  <p style="font-size:12px;color:#666;"><a href="{ev['url']}">🔗 查看英文原文</a> ｜ <a href="https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit">📊 打开云端历史归档表 (Logs)</a></p>
+                  <hr style="border:none;border-top:1px solid #555;margin:10px 0;"/>
+                  <div style="white-space:pre-wrap;font-size:14px;">{deep_text}</div>
+                  <hr style="border:none;border-top:1px solid #555;margin:10px 0;"/>
+                  <p style="font-size:13px;"><a href="{ev['url']}">🔗 查看英文原文</a> ｜ <a href="https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit">📊 打开云端历史归档表 (Logs)</a></p>
                 </div>
                 """
                 send_pushplus(push_token, deep_title, deep_html)
