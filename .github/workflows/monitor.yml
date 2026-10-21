@@ -1,0 +1,25 @@
+name: US Stock Catalyst 24x7 Cloud Monitor
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run SEC EDGAR & Mainstream Media Catalyst Monitor
+        env:
+          GSHEETS_TOKEN_JSON: ${{ secrets.GSHEETS_TOKEN_JSON }}
+          SPREADSHEET_ID: '1pIKfEy9UNPs32W5gBFJu3N5doqU-SKCvIBDjX-TMwGQ'
+        run: python monitor.py
