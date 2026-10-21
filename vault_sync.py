@@ -377,15 +377,15 @@ def markdown_to_styled_html(title, subtitle, summary_text, body_md):
 
 def create_bilingual_doc_and_pdf_in_drive(access_token, output_folder_id, base_title, html_content):
     """
-    利用 Google Drive 官方云端渲染引擎：
-    1. 将排版好的中英对照 HTML 创建为 Google 在线文档 (Google Doc)
+    利用 Google Drive 官方云端渲染引擎生成单一纯净的【中英对照PDF】：
+    1. 临时将排版好的 HTML 导入为云端渲染实例
     2. 调用 Drive Export API 直接导出为高质量中文排版 PDF 并存入 `03_中英对照译文与解析` 文件夹
+    3. 立即自动销毁临时在线文档实例，确保文件夹内只保留 1 份纯净的 PDF 文件！
     """
     boundary = "===AntigravityVaultBoundary==="
     doc_meta = {
-        "name": f"【中英对照在线版】{base_title}",
+        "name": f"_temp_render_{base_title}",
         "mimeType": "application/vnd.google-apps.document",
-        "parents": [output_folder_id],
     }
     body_parts = (
         f"--{boundary}\r\n"
@@ -411,15 +411,26 @@ def create_bilingual_doc_and_pdf_in_drive(access_token, output_folder_id, base_t
         doc_info = json.loads(resp.read().decode("utf-8"))
 
     doc_id = doc_info["id"]
-    doc_link = doc_info.get("webViewLink", f"https://docs.google.com/document/d/{doc_id}/edit")
 
-    # 导出为原生 PDF 并上传到同一输出文件夹
-    export_url = f"https://www.googleapis.com/drive/v3/files/{doc_id}/export?mimeType=application/pdf"
-    req_exp = urllib.request.Request(
-        export_url, headers={"Authorization": f"Bearer {access_token}"}
-    )
-    with urllib.request.urlopen(req_exp, timeout=60) as resp:
-        pdf_bytes = resp.read()
+    try:
+        # 导出为原生 PDF 二进制流
+        export_url = f"https://www.googleapis.com/drive/v3/files/{doc_id}/export?mimeType=application/pdf"
+        req_exp = urllib.request.Request(
+            export_url, headers={"Authorization": f"Bearer {access_token}"}
+        )
+        with urllib.request.urlopen(req_exp, timeout=60) as resp:
+            pdf_bytes = resp.read()
+    finally:
+        # 立即删除临时渲染用的 Google Doc，确保只留下一份 PDF
+        try:
+            del_req = urllib.request.Request(
+                f"https://www.googleapis.com/drive/v3/files/{doc_id}",
+                headers={"Authorization": f"Bearer {access_token}"},
+                method="DELETE",
+            )
+            urllib.request.urlopen(del_req, timeout=20).close()
+        except Exception:
+            pass
 
     pdf_meta = {
         "name": f"【中英对照PDF】{base_title}.pdf",
@@ -447,7 +458,7 @@ def create_bilingual_doc_and_pdf_in_drive(access_token, output_folder_id, base_t
         pdf_info = json.loads(resp.read().decode("utf-8"))
 
     pdf_link = pdf_info.get("webViewLink", f"https://drive.google.com/file/d/{pdf_info['id']}/view")
-    return pdf_link, doc_link
+    return pdf_link, pdf_link
 
 
 def load_vault_sheet_records(access_token):
@@ -568,7 +579,7 @@ def sync_drive_vault(access_token, config, portfolio, send_pushplus_fn=None):
                         f"📚【网站底稿已同步】{tk_up} | {base_name[:22]}",
                         f"<p>已自动解析您上传的网站/催化剂底稿 <b>{html.escape(fmeta['name'])}</b> 并注入实时监控比对库：</p>"
                         f"<div style='background:#fef7e0;padding:10px;border-radius:4px;white-space:pre-wrap;'>{html.escape(tk_note)}</div>"
-                        f"<p><a href='{pdf_link}'>📄 点击下载中英对照 PDF</a> ｜ <a href='{doc_link}'>📝 打开在线文档</a></p>",
+                        f"<p><a href='{pdf_link}'>📄 点击打开/下载中英对照 PDF</a></p>",
                     )
             processed_vault_ids.add(v_id)
             processed_count += 1
@@ -647,7 +658,7 @@ def sync_drive_vault(access_token, config, portfolio, send_pushplus_fn=None):
                             f"📚【中英对照PDF已生成】{ticker} | {base_name[:20]}",
                             f"<p><b>标的：</b>{ticker} ({stock['company']})<br/><b>口径分类：</b>{role_label}<br/><b>原始文件：</b>{html.escape(fname)}</p>"
                             f"<div style='background:#fef7e0;padding:10px;border-radius:4px;white-space:pre-wrap;font-size:13px;'><b>【核心结构化提炼】</b>\n{html.escape(summary)}</div>"
-                            f"<p style='margin-top:10px;'><a href='{pdf_link}'>👉 点击打开/下载中英对照 PDF</a> ｜ <a href='{doc_link}'>📝 打开 Google Doc 在线对照版</a></p>",
+                            f"<p style='margin-top:10px;'><a href='{pdf_link}'>👉 点击打开/下载中英对照 PDF</a></p>",
                         )
                     processed_vault_ids.add(v_id)
                     processed_count += 1
