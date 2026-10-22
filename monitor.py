@@ -37,16 +37,19 @@ SPREADSHEET_ID = os.environ.get(
 SEC_USER_AGENT = "AntigravityBiotechMonitor/3.0 (neo664939@gmail.com)"
 
 GEMINI_TRIAGE_MODELS = [
+    "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
     "gemini-3.5-flash",
     "gemini-3.6-flash",
-    "gemini-3-flash-preview",
-    "gemini-3.1-flash-lite-preview",
 ]
 
 GEMINI_DEEP_MODELS = [
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
-    "gemini-3-flash-preview",
 ]
 
 
