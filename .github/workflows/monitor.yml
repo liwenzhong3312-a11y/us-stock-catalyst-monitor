@@ -2,20 +2,20 @@ name: US Stock Catalyst 24x7 Cloud Monitor
 
 on:
   schedule:
-    # 1. 美股盘前+开盘黄金窗口（北京时间 18:00 - 23:00 / 美东 06:00 - 11:00 AM）：每 10 分钟高频巡检
-    - cron: '*/10 10-14 * * 1-5'
-    # 2. 美股盘后公告黄金窗口（北京时间 04:00 - 06:00 / 美东 16:00 - 18:00 PM）：每 10 分钟高频巡检
-    - cron: '*/10 20-21 * * 1-5'
-    # 3. 工作日其余时段：每 30 分钟巡检一次
-    - cron: '0,30 0-9,15-19,22-23 * * 1-5'
-    # 4. 周末（覆盖医学大会壁报/突发并购）：每 2 小时巡检一次
+    # 1. 美股盘前+开盘黄金窗口（北京时间 18:00 - 23:00 / 美东 06:00 - 11:00 AM）：每 12 分钟接力常驻
+    - cron: '*/12 10-14 * * 1-5'
+    # 2. 美股盘后公告黄金窗口（北京时间 04:00 - 06:00 / 美东 16:00 - 18:00 PM）：每 12 分钟接力常驻
+    - cron: '*/12 20-21 * * 1-5'
+    # 3. 工作日其余时段：每 20 分钟接力常驻
+    - cron: '*/20 0-9,15-19,22-23 * * 1-5'
+    # 4. 周末（医学大会与突发交易）：每 2 小时常规巡检
     - cron: '0 */2 * * 6,0'
   workflow_dispatch:
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 18
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -25,11 +25,12 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install lightweight PDF splitter
+      - name: Install lightweight dependencies
         run: pip install --quiet pypdf
 
-      - name: Run SEC EDGAR, Gmail, Media & Google Drive Research Vault Sync
+      - name: Run Real-Time SEC, Gmail IMAP, Media & Vault Sync
         env:
           GSHEETS_TOKEN_JSON: ${{ secrets.GSHEETS_TOKEN_JSON }}
           SPREADSHEET_ID: '1pIKfEy9UNPs32W5gBFJu3N5doqU-SKCvIBDjX-TMwGQ'
+          MONITOR_DURATION_MINUTES: '14'
         run: python monitor.py
