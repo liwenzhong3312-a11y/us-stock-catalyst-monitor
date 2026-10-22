@@ -338,26 +338,42 @@ SEC_8K_ITEMS_CN = {
 
 
 def fetch_sec_press_exhibits(cik_int, acc_no_hyphen, max_chars=25000):
-    """读取 8-K 的 EX-99.x 附件（公司官方新闻稿全文），返回 (标题, 正文, 链接)"""
+    """读取 8-K 的 EX-99.x 附件（公司官方新闻稿全文），返回 (标题, 正文, 链接, 真实美东受理时间dt)"""
     base = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no_hyphen}/"
+    items_meta = []
     try:
         idx = http_json(base + "index.json", headers={"User-Agent": SEC_USER_AGENT}, timeout=20)
-        names = [it.get("name", "") for it in idx.get("directory", {}).get("item", [])]
+        items_meta = idx.get("directory", {}).get("item", [])
+        names = [it.get("name", "") for it in items_meta]
     except Exception:
-        return "", "", ""
+        return "", "", "", None
+
+    # 从 index.json 提取 SEC 官方真实美东受理时间 (如 '2026-10-19 09:06:14' EDT)
+    real_et_dt = None
+    for it in items_meta:
+        lm = (it.get("last-modified") or "").strip()
+        if lm:
+            try:
+                from zoneinfo import ZoneInfo
+                naive_dt = datetime.datetime.strptime(lm, "%Y-%m-%d %H:%M:%S")
+                real_et_dt = naive_dt.replace(tzinfo=ZoneInfo("America/New_York"))
+                break
+            except Exception:
+                pass
+
     ex_files = sorted(
         n for n in names
         if re.search(r"(?i)(ex[-_]?99|exhibit[-_]?99|ex99|dex99)", n) and n.lower().endswith((".htm", ".html"))
     )
     if not ex_files:
-        return "", "", ""
+        return "", "", "", real_et_dt
     texts = []
     for n in ex_files[:3]:
         t = fetch_webpage_plain_text(base + n, is_sec=True, max_chars=max_chars)
         if t:
             texts.append(t)
     if not texts:
-        return "", "", ""
+        return "", "", "", real_et_dt
     full = "\n\n".join(texts)[:max_chars]
     # 标题提取：跳过 EX-99.1 / 文件名 / 页码等表头，合并被 HTML 换行切碎的多行主标题
     headline_parts = []
@@ -377,7 +393,7 @@ def fetch_sec_press_exhibits(cik_int, acc_no_hyphen, max_chars=25000):
                 headline_parts.append(ln)
             break
     headline = " ".join(headline_parts)[:260]
-    return headline, full, base + ex_files[0]
+    return headline, full, base + ex_files[0], real_et_dt
 
 
 def fetch_sec_edgar_events(stock, cik, max_age_hours=36):
@@ -427,7 +443,9 @@ def fetch_sec_edgar_events(stock, cik, max_age_hours=36):
             url_show = doc_url
             if form.startswith("8-K") or form == "6-K":
                 # 8-K 封面页几乎没有内容，真正的新闻稿/数据在附件 EX-99.x 里
-                ex_headline, ex_text, ex_url = fetch_sec_press_exhibits(cik_int, acc_no_hyphen)
+                ex_headline, ex_text, ex_url, real_et_dt = fetch_sec_press_exhibits(cik_int, acc_no_hyphen)
+                if real_et_dt:
+                    dt = real_et_dt
                 if ex_text:
                     body = ex_text
                     url_show = ex_url
