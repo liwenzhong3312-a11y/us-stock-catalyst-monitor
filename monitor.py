@@ -846,9 +846,9 @@ def gemini_translate_facts(ev, api_key):
 {ev['body_en']}
 
 ⚠️ 铁律要求（违反任何一条均为不合格）：
-1. **严禁总结、严禁缩写、严禁省略任何段落或数据！** 必须对英文原稿进行从头到尾的**完整全文翻译**，绝不允许把几千字的新闻稿概括成几百字的摘要！
-2. **第一部分【核心要点 (Highlights)】（若原稿有）**：新闻稿标题下方、正式电头（如 `CITY, State -- (BUSINESS WIRE / GLOBE NEWSWIRE) -- Date`）之前通常有若干条核心亮点导语（Highlights）。你必须首先在 `【核心要点 (Highlights)】` 标题下，用 `• ` **逐条、完整、一字不漏地翻译每一条 Highlight**（100%保留所有实验数据、终点名称、剂量组、百分比、p值与时间点）。
-3. **第二部分【新闻稿完整正文与数据表格】**：
+1. **严禁总结、严禁缩写、严禁省略任何段落或数据！** 必须对英文原稿进行从头到尾的**完整全文翻译**，绝不允许把几千字的新闻稿概括成几百字的摘要！不要输出“【核心要点 (Highlights)】”或“【新闻稿完整正文与数据表格】”之类多余的分节小标题，直接输出内容！
+2. **开头导语要点 Highlights（全部加粗显示）**：新闻稿标题下方、正式电头（如 `CITY, State -- (BUSINESS WIRE / GLOBE NEWSWIRE) -- Date`）之前通常有若干条核心亮点导语（Highlights）。你必须在最开头用 `• **...**` 的格式（**整条要点用粗体 `**` 包裹**），**逐条、完整、一字不漏地翻译每一条 Highlight**（100%保留所有实验数据、终点名称、剂量组、百分比、p值与时间点）。
+3. **新闻稿完整正文与临床数据表格**：
    - 从电头（如 `康涅狄格州纽黑文 -- (美国商业资讯) -- 2026年10月19日 -- ...`）开始，严格按照英文原稿的自然段落顺序，**逐段完整直译每一段正文**。
    - **完整还原所有数据表格（如 Table 1、Table 2 等）**：严禁用文字概述表格！英文原稿中的表格已展开为等宽列网格（每一行的 `|` 分隔单元格数量完全相等，跨列表头已按列重复展开，跨行分类已在首列重复展开）。你在翻译表格时，**每一行的 `|` 单元格总数必须与英文原表每一行的单元格总数 100% 严格相等**（例如原表第一行有 3 个重复的 `New Study '304' Topline` 对应下方的 `QD | BID | Placebo`，你也必须在第一行保留对应的空单元格及 3 个重复的 `新“304”研究顶线数据` 单元格；原表首列若有重复的跨行分类名称，也必须在每一行首列保留），以便下游渲染引擎自动合并生成完美的 `colspan` 跨列表头与 `rowspan` 跨行单元格！
    - **完整翻译所有高管与临床专家（KOL）引语**：管理层与外部医学专家的每一段发言必须完整逐句翻译，不得删减。
@@ -1072,14 +1072,23 @@ def format_body_for_wechat_html(text):
         out_parts.append("".join(t_html))
         table_rows = []
 
+    in_opening_highlights = True
     for ln in lines:
         s = ln.strip()
+        if re.match(r"^【(核心要点|新闻稿完整正文).*】$", s):
+            continue
         if s.startswith("|") and s.endswith("|") and s.count("|") >= 2:
+            in_opening_highlights = False
             table_rows.append(s)
         else:
             flush_table()
+            if re.search(r"(--\s*\(|（美国商业资讯）|（环球电讯社）|（美通社）|BUSINESS WIRE|GLOBE NEWSWIRE)", s):
+                in_opening_highlights = False
             esc = html.escape(ln)
             esc = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc)
+            # 确保开头导语中的所有 • 要点 (Highlights) 强制以粗体展示
+            if in_opening_highlights and s.startswith(("•", "·", "* ")) and "<b>" not in esc:
+                esc = f"<b>{esc}</b>"
             out_parts.append(esc)
     flush_table()
     return "\n".join(out_parts)
@@ -1179,29 +1188,24 @@ def main():
         if score <= 3:
             deep_text = "常规低相关事项（重要度≤3，已静默归档）"
         else:
-            # 第一条推送：严格只发【基础事实：原始发布时间 + 原始信源 + 英文原标题 + 中文翻译标题 + 中文翻译正文】
-            badge = "📋【基础事实】"
-            fact_push_title = f"{badge} {stock['ticker']} | { title_cn[:28] }"
+            # 第一条推送：极简争分夺秒版【Ticker | 中文完整标题】+ 标题对照 + 加粗 Highlights + 全文与表格
+            fact_push_title = f"{stock['ticker']} | {title_cn}"
             fact_html = f"""
-            <div style="font-family:sans-serif;line-height:1.7;font-size:14px;">
-              <p style="margin:0 0 6px 0;">
-                <b>标的：</b>{stock['ticker']} ({stock['company']}) ｜ <b>分类：</b>{category} ｜ <b>重要度：{score}/10</b>
+            <div style="font-family:sans-serif;line-height:1.68;font-size:14px;">
+              <p style="margin:0 0 6px 0;font-size:13px;">
+                <b>{stock['ticker']}</b> ({stock['company']}) ｜ {category} ｜ <b>{score}/10</b><br/>
+                🕒 {html.escape(time_label)}：{html.escape(pub_time_str)}<br/>
+                📡 信源：{html.escape(ev['source'])}
               </p>
-              <p style="margin:0 0 10px 0;font-size:13px;">
-                🕒 <b>{html.escape(time_label)}：</b>{html.escape(pub_time_str)}<br/>
-                📡 <b>原始信源 ({html.escape(source_tier)})：</b>{html.escape(ev['source'])}
+              <p style="margin:8px 0;line-height:1.5;">
+                <b>标题：</b>{html.escape(ev['title'])}<br/>
+                <b>{html.escape(title_cn)}</b>
               </p>
-              <div style="border-left:3px solid #888;padding-left:10px;margin:10px 0;">
-                <b>【英文原标题】</b><br/>{html.escape(ev['title'])}
-              </div>
-              <div style="border-left:3px solid #3b82f6;padding-left:10px;margin:10px 0;font-size:15px;">
-                <b>【中文翻译标题】</b><br/><b>{html.escape(title_cn)}</b>
-              </div>
-              <hr style="border:none;border-top:1px solid #555;margin:10px 0;"/>
-              <div style="margin:10px 0;font-size:14px;white-space:pre-wrap;"><b>【中文全文精译（含全部 Highlights 要点 + 完整正文 + 临床数据表）】</b>\n{format_body_for_wechat_html(body_cn)}</div>
-              <hr style="border:none;border-top:1px solid #555;margin:10px 0;"/>
-              <p style="margin:6px 0;font-size:13px;">
-                <a href="{ev['url']}">👉 点击查看英文原文完整出处</a>
+              <hr style="border:none;border-top:1px solid #555;margin:8px 0;"/>
+              <div style="margin:8px 0;font-size:14px;white-space:pre-wrap;">{format_body_for_wechat_html(body_cn)}</div>
+              <hr style="border:none;border-top:1px solid #555;margin:8px 0;"/>
+              <p style="margin:4px 0;font-size:13px;">
+                <a href="{ev['url']}">🔗 查看英文原稿</a>
               </p>
             </div>
             """
@@ -1219,19 +1223,19 @@ def main():
                     ev, facts, api_key, vault_notes=stock_vault_notes
                 )
                 vault_badge = " + 投研库内外口径比对" if stock_vault_notes else ""
-                deep_title = f"🔬【深度解读】{stock['ticker']} | {category} ({score}/10)"
+                deep_title = f"【解读】{stock['ticker']} | {title_cn}"
                 deep_html = f"""
-                <div style="font-family:sans-serif;line-height:1.7;font-size:14px;">
+                <div style="font-family:sans-serif;line-height:1.68;font-size:14px;">
                   <p style="margin:0 0 8px 0;font-size:13px;">
-                    <b>关联事件：</b>{html.escape(title_cn)}<br/>
+                    <b>关联标题：</b>{html.escape(title_cn)}<br/>
                     🕒 <b>{html.escape(time_label)}：</b>{html.escape(pub_time_str)}<br/>
-                    📡 <b>原始信源：</b>{html.escape(ev['source'])}<br/>
-                    🧠 <b>推理引擎：</b>{deep_model} + ClinicalTrials.gov 官方试验库{vault_badge}
+                    📡 <b>信源：</b>{html.escape(ev['source'])}<br/>
+                    🧠 <b>引擎：</b>{deep_model} + ClinicalTrials.gov{vault_badge}
                   </p>
-                  <hr style="border:none;border-top:1px solid #555;margin:10px 0;"/>
-                  <div style="white-space:pre-wrap;font-size:14px;">{deep_text}</div>
-                  <hr style="border:none;border-top:1px solid #555;margin:10px 0;"/>
-                  <p style="font-size:13px;"><a href="{ev['url']}">🔗 查看英文原文</a> ｜ <a href="https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit">📊 打开云端历史归档表 (Logs)</a></p>
+                  <hr style="border:none;border-top:1px solid #555;margin:8px 0;"/>
+                  <div style="white-space:pre-wrap;font-size:14px;">{format_body_for_wechat_html(deep_text)}</div>
+                  <hr style="border:none;border-top:1px solid #555;margin:8px 0;"/>
+                  <p style="font-size:13px;"><a href="{ev['url']}">🔗 查看英文原稿</a> ｜ <a href="https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit">📊 打开云端历史归档表 (Logs)</a></p>
                 </div>
                 """
                 send_pushplus(push_token, deep_title, deep_html)
