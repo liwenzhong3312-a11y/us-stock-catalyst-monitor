@@ -84,6 +84,29 @@ def clean_boilerplate_text(text):
     return cleaned
 
 
+def html_to_text(raw):
+    """
+    HTML 转纯文本。注意顺序：必须【先去标签、后反转义】。
+    旧版先 unescape 再去标签，会把 'p&lt;0.0001' 变成 'p<0.0001 ...>' 后被当作标签整段吞掉，
+    导致临床新闻稿里所有 p 值及其后的数据全部丢失。
+    """
+    if not raw:
+        return ""
+    s = re.sub(r"(?is)<(script|style|head|noscript)[^>]*>.*?</\1>", " ", raw)
+    s = re.sub(r"(?is)<!--.*?-->", " ", s)
+    # 块级元素 -> 换行；表格单元格 -> 分隔符；其余行内标签直接去掉（保持 'p<0.0001' 连续）
+    s = re.sub(r"(?i)<br\s*/?>", "\n", s)
+    s = re.sub(r"(?i)</?(p|div|tr|li|ul|ol|h[1-6]|table|section|article|blockquote)\b[^>]*>", "\n", s)
+    s = re.sub(r"(?i)</t[dh]\s*>", " | ", s)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = html.unescape(s).replace("\xa0", " ")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r" *\n *", "\n", s)
+    s = re.sub(r"(\s*\|\s*){2,}", " | ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
 def fetch_webpage_plain_text(url, is_sec=False, max_chars=6000):
     """抓取公告或新闻原文正文"""
     if not url or "news.google.com/rss/articles" in url:
@@ -97,11 +120,8 @@ def fetch_webpage_plain_text(url, is_sec=False, max_chars=6000):
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=15) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
-        raw = re.sub(r"(?is)<(script|style|head|nav|footer)[^>]*>.*?</\1>", " ", raw)
-        text = re.sub(r"<[^>]+>", "\n", html.unescape(raw))
-        text = re.sub(r"[ \t]+", " ", text)
-        text = re.sub(r"\n\s*\n+", "\n\n", text).strip()
-        return clean_boilerplate_text(text)[:max_chars]
+        raw = re.sub(r"(?is)<(nav|footer)[^>]*>.*?</\1>", " ", raw)
+        return clean_boilerplate_text(html_to_text(raw))[:max_chars]
     except Exception:
         return ""
 
@@ -273,6 +293,46 @@ def fetch_sec_cik_map():
         return {}
 
 
+SEC_8K_ITEMS_CN = {
+    "1.01": "重大协议", "1.02": "终止重大协议", "2.02": "经营业绩", "3.02": "未注册股票发行",
+    "5.02": "高管/董事变动", "5.07": "股东会表决", "7.01": "Reg FD 披露", "8.01": "其他重大事项",
+    "9.01": "财务报表与附件",
+}
+
+
+def fetch_sec_press_exhibits(cik_int, acc_no_hyphen, max_chars=15000):
+    """读取 8-K 的 EX-99.x 附件（公司官方新闻稿全文），返回 (标题, 正文, 链接)"""
+    base = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no_hyphen}/"
+    try:
+        idx = http_json(base + "index.json", headers={"User-Agent": SEC_USER_AGENT}, timeout=20)
+        names = [it.get("name", "") for it in idx.get("directory", {}).get("item", [])]
+    except Exception:
+        return "", "", ""
+    ex_files = sorted(
+        n for n in names
+        if re.search(r"(?i)(ex[-_]?99|exhibit[-_]?99|ex99|dex99)", n) and n.lower().endswith((".htm", ".html"))
+    )
+    if not ex_files:
+        return "", "", ""
+    texts = []
+    for n in ex_files[:3]:
+        t = fetch_webpage_plain_text(base + n, is_sec=True, max_chars=max_chars)
+        if t:
+            texts.append(t)
+    if not texts:
+        return "", "", ""
+    full = "\n\n".join(texts)[:max_chars]
+    # 标题：跳过 EX-99.1 / 文件名 / 页码等表头，取首个实质句
+    headline = ""
+    for line in texts[0].splitlines():
+        ln = line.strip()
+        if len(ln) < 25 or re.match(r"(?i)^(ex-?99|exhibit\s*99|\d+$|.*\.htm$)", ln):
+            continue
+        headline = ln[:220]
+        break
+    return headline, full, base + ex_files[0]
+
+
 def fetch_sec_edgar_events(stock, cik, max_age_hours=36):
     events = []
     if not cik:
@@ -301,42 +361,91 @@ def fetch_sec_edgar_events(stock, cik, max_age_hours=36):
             accept_str = str(accept_times[i]).strip() if i < len(accept_times) else ""
             fdate = str(filing_dates[i]).strip() if i < len(filing_dates) else ""
 
+            dt = None
             if accept_str:
                 try:
                     dt = datetime.datetime.fromisoformat(accept_str.replace("Z", "+00:00"))
                     if (now_utc - dt).total_seconds() / 3600.0 > max_age_hours:
                         continue
                 except Exception:
-                    pass
+                    dt = None
 
             cik_int = str(int(cik))
             doc_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no_hyphen}/{doc}"
             items_desc = str(items_list[i]) if i < len(items_list) else ""
             event_id = f"SEC_{stock['ticker']}_{acc}"
 
-            doc_text = fetch_webpage_plain_text(doc_url, is_sec=True, max_chars=5500)
+            title = f"{stock['company']} ({stock['ticker']}) - SEC Form {form} ({fdate})"
+            body = ""
+            url_show = doc_url
+            if form.startswith("8-K") or form == "6-K":
+                # 8-K 封面页几乎没有内容，真正的新闻稿/数据在附件 EX-99.x 里
+                ex_headline, ex_text, ex_url = fetch_sec_press_exhibits(cik_int, acc_no_hyphen)
+                if ex_text:
+                    body = ex_text
+                    url_show = ex_url
+                    if ex_headline:
+                        title = ex_headline
+            if not body:
+                body = fetch_webpage_plain_text(doc_url, is_sec=True, max_chars=8000)
 
-            form_label = {
-                "8-K": "8-K 重大事项公告",
-                "8-K/A": "8-K/A 补充事项公告",
-                "4": "Form 4 内部人持股变动表",
-                "SC 13D": "SC 13D 重要股东持股变动",
-                "SC 13G": "SC 13G 机构持股超5%备案",
-            }.get(form, f"{form} 备案文件")
-
+            item_cn = "、".join(
+                SEC_8K_ITEMS_CN.get(x.strip(), x.strip()) for x in items_desc.split(",") if x.strip()
+            )
             events.append(
                 {
                     "id": event_id,
                     "stock": stock,
-                    "source": f"SEC 官方文件 ({form})",
-                    "title": f"{stock['company']} ({stock['ticker']}) - SEC Form {form} ({fdate})",
-                    "body_en": doc_text or f"SEC Form {form} (Items: {items_desc}). Please see original filing at {doc_url}",
-                    "url": doc_url,
+                    "source": f"SEC EDGAR 官方文件 (Form {form}{'；' + item_cn if item_cn else ''})",
+                    "source_tier": "一手官方",
+                    "published_at": dt,
+                    "time_label": "SEC 受理时间",
+                    "title": title,
+                    "body_en": body or f"SEC Form {form} (Items: {items_desc}). Please see original filing at {doc_url}",
+                    "url": url_show,
                 }
             )
     except Exception as e:
         print(f"[WARN] SEC check failed for {stock['ticker']}: {e}")
     return events
+
+
+def format_pub_time(dt, time_label="原始发布时间"):
+    """将 UTC/带时区时间格式化为：美东时间 + 北京时间，让用户一眼看清信息真实发布时刻"""
+    if not dt or not isinstance(dt, datetime.datetime):
+        return "未知时间"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        et_dt = dt.astimezone(ZoneInfo("America/New_York"))
+        et_str = et_dt.strftime("%Y-%m-%d %H:%M %Z")
+    except Exception:
+        et_dt = dt.astimezone(datetime.timezone(datetime.timedelta(hours=-4)))
+        et_str = et_dt.strftime("%Y-%m-%d %H:%M EDT")
+    bj_dt = dt.astimezone(datetime.timezone(datetime.timedelta(hours=8)))
+    bj_str = bj_dt.strftime("%Y-%m-%d %H:%M")
+    return f"{bj_str} 北京时间（{et_str}）"
+
+
+def has_substantive_body(title, body_en):
+    """判断正文是否包含实质性段落（剔除仅把标题重复一遍的无正文空壳邮件/快讯）"""
+    if not body_en:
+        return False
+    t_norm = re.sub(r"\s+", " ", (title or "")).strip().lower()
+    b_norm = re.sub(r"\s+", " ", body_en).strip()
+    # 移除正文中与标题完全重合的部分
+    if t_norm and t_norm in b_norm.lower():
+        idx = b_norm.lower().find(t_norm)
+        b_norm = (b_norm[:idx] + " " + b_norm[idx + len(t_norm):]).strip()
+    # 移除网址与常见引导点击短语
+    b_norm = re.sub(r"https?://\S+", "", b_norm)
+    b_norm = re.sub(
+        r"(?i)\b(read now|full article|click here|view presentation|slideshow|transcript)\b",
+        "",
+        b_norm,
+    ).strip()
+    return len(b_norm) >= 160
 
 
 def fetch_yahoo_direct_news(stock, max_age_hours=24):
@@ -361,8 +470,10 @@ def fetch_yahoo_direct_news(stock, max_age_hours=24):
             link = (item.findtext("link") or "").strip()
             guid = (item.findtext("guid") or link).strip()
             pub_date = (item.findtext("pubDate") or "").strip()
-            desc = clean_boilerplate_text(re.sub(r"<[^>]+>", " ", html.unescape(item.findtext("description") or "")).strip())
+            source_tag = (item.findtext("source") or "").strip()
+            desc = clean_boilerplate_text(html_to_text(item.findtext("description") or ""))
 
+            dt = None
             if pub_date:
                 try:
                     dt = parsedate_to_datetime(pub_date)
@@ -376,17 +487,24 @@ def fetch_yahoo_direct_news(stock, max_age_hours=24):
             if not is_strict_match_for_stock(f"{title} {desc}", stock):
                 continue
 
-            full_text = fetch_webpage_plain_text(link, is_sec=False, max_chars=5500)
+            full_text = fetch_webpage_plain_text(link, is_sec=False, max_chars=7500)
             body_en = full_text if len(full_text) > len(desc) else desc
+            if not has_substantive_body(title, body_en):
+                # 无实质正文的空壳链接不推送
+                continue
 
+            pub_name = source_tag or "Yahoo Finance 聚合通稿"
             short_hash = hashlib.sha1(guid.encode("utf-8")).hexdigest()[:16]
             events.append(
                 {
                     "id": f"YF_{stock['ticker']}_{short_hash}",
                     "stock": stock,
-                    "source": "一手新闻通稿/财经媒体",
+                    "source": f"新闻通稿：{pub_name}",
+                    "source_tier": "一手通稿/媒体",
+                    "published_at": dt,
+                    "time_label": "原始发布时间",
                     "title": title,
-                    "body_en": body_en or title,
+                    "body_en": body_en,
                     "url": link,
                 }
             )
@@ -408,7 +526,7 @@ def decode_mime_str(s):
     return "".join(out)
 
 
-def fetch_gmail_imap_events(config, portfolio, processed_ids):
+def fetch_gmail_imap_events(config, portfolio, processed_ids, max_age_hours=24):
     events = []
     app_pwd = config.get("GMAIL_APP_PASSWORD", "").replace(" ", "").strip()
     gmail_user = config.get("GMAIL_ADDRESS", "neo664939@gmail.com").strip() or "neo664939@gmail.com"
@@ -425,6 +543,7 @@ def fetch_gmail_imap_events(config, portfolio, processed_ids):
             mail.logout()
             return events
 
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
         msg_nums = data[0].split()[-25:]
         for num in reversed(msg_nums):
             st, msg_data = mail.fetch(num, "(RFC822)")
@@ -439,6 +558,18 @@ def fetch_gmail_imap_events(config, portfolio, processed_ids):
 
             subject = decode_mime_str(msg.get("Subject", "(无标题)")).strip()
             sender = decode_mime_str(msg.get("From", "")).strip()
+            date_hdr = (msg.get("Date") or "").strip()
+
+            msg_dt = None
+            if date_hdr:
+                try:
+                    msg_dt = parsedate_to_datetime(date_hdr)
+                    if msg_dt.tzinfo is None:
+                        msg_dt = msg_dt.replace(tzinfo=datetime.timezone.utc)
+                    if (now_utc - msg_dt).total_seconds() / 3600.0 > max_age_hours:
+                        continue
+                except Exception:
+                    pass
 
             # 跳过订阅确认信本身
             if re.search(r"(?i)(confirm your subscription|verify your email|welcome to .* investor)", subject):
@@ -463,20 +594,30 @@ def fetch_gmail_imap_events(config, portfolio, processed_ids):
                         payload = part.get_payload(decode=True)
                         if payload:
                             raw_html = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
-                            body_text = re.sub(r"<[^>]+>", "\n", html.unescape(raw_html))
+                            body_text = html_to_text(raw_html)
 
             cleaned_body = clean_boilerplate_text(body_text)
             combined = f"{subject}\n{cleaned_body}"
 
+            is_seeking_alpha = "seekingalpha.com" in sender.lower()
+            source_tier = "第三方财经平台订阅" if is_seeking_alpha else "IR/邮件订阅"
+
             for stock in portfolio:
                 if is_strict_match_for_stock(combined, stock):
+                    if not has_substantive_body(subject, cleaned_body):
+                        print(f"[INFO] Skipping title-only shell email for {stock['ticker']}: {subject} (from {sender})")
+                        processed_ids.add(ev_id)
+                        break
                     events.append(
                         {
                             "id": ev_id,
                             "stock": stock,
-                            "source": f"Gmail 订阅邮件 ({sender[:35]})",
+                            "source": f"{source_tier}：{sender[:45]}",
+                            "source_tier": source_tier,
+                            "published_at": msg_dt,
+                            "time_label": "邮件原始发送时间",
                             "title": subject,
-                            "body_en": cleaned_body[:5000] if len(cleaned_body) > 30 else subject,
+                            "body_en": cleaned_body[:7500],
                             "url": "https://mail.google.com/mail/u/0/#inbox",
                         }
                     )
@@ -697,19 +838,32 @@ def main():
     cik_map = fetch_sec_cik_map()
     all_events = []
 
-    gmail_ev = fetch_gmail_imap_events(config, portfolio, processed_ids)
-    all_events.extend(gmail_ev)
-
+    # 1. 最高优先级：一手官方 SEC EDGAR 申报与附带 EX-99.1 官方新闻稿全文
     for stock in portfolio:
         cik = cik_map.get(stock["ticker"])
-        sec_ev = fetch_sec_edgar_events(stock, cik, max_age_hours=48)
-        yf_ev = fetch_yahoo_direct_news(stock, max_age_hours=36)
-        for ev in sec_ev + yf_ev:
+        sec_ev = fetch_sec_edgar_events(stock, cik, max_age_hours=24)
+        for ev in sec_ev:
             if ev["id"] not in processed_ids:
                 all_events.append(ev)
 
+    # 2. 次高优先级：Yahoo Finance 聚合的一手公关通稿 (GlobeNewswire / PRNewswire / BusinessWire)
+    for stock in portfolio:
+        yf_ev = fetch_yahoo_direct_news(stock, max_age_hours=24)
+        for ev in yf_ev:
+            if ev["id"] not in processed_ids:
+                all_events.append(ev)
+
+    # 3. 辅助信源：Gmail 订阅邮件（自动拦截无正文的空壳/标题党邮件）
+    gmail_ev = fetch_gmail_imap_events(config, portfolio, processed_ids, max_age_hours=24)
+    all_events.extend(gmail_ev)
+
     for ev in all_events[:5]:
         stock = ev["stock"]
+        if not has_substantive_body(ev["title"], ev["body_en"]):
+            print(f"[INFO] Skipping event without substantive body for {stock['ticker']}: {ev['title']}")
+            processed_ids.add(ev["id"])
+            continue
+
         facts = gemini_translate_facts(ev, api_key)
         if not facts.get("is_relevant", True):
             processed_ids.add(ev["id"])
@@ -720,16 +874,30 @@ def main():
         title_cn = facts.get("title_cn", ev["title"])
         body_cn = facts.get("body_cn", "")
 
+        # 铁律：若翻译后仍判定为“仅含标题，尚无详细正文段落”，绝不推送空壳通知、绝不虚构深度解读！
+        if "仅含标题" in body_cn or len(body_cn.strip()) < 60:
+            print(f"[INFO] Blocked empty/title-only translation from pushing for {stock['ticker']}: {ev['title']}")
+            processed_ids.add(ev["id"])
+            continue
+
+        pub_time_str = format_pub_time(ev.get("published_at"))
+        time_label = ev.get("time_label", "原始发布时间")
+        source_tier = ev.get("source_tier", "外部信源")
+
         if score <= 3:
             deep_text = "常规低相关事项（重要度≤3，已静默归档）"
         else:
-            # 第一条推送：严格只发【基础事实：英文原标题 + 中文翻译标题 + 中文翻译正文】（自适应微信深色/浅色模式，不设浅色背景块）
+            # 第一条推送：严格只发【基础事实：原始发布时间 + 原始信源 + 英文原标题 + 中文翻译标题 + 中文翻译正文】
             badge = "📋【基础事实】"
             fact_push_title = f"{badge} {stock['ticker']} | { title_cn[:28] }"
             fact_html = f"""
             <div style="font-family:sans-serif;line-height:1.7;font-size:14px;">
-              <p style="margin:0 0 8px 0;">
+              <p style="margin:0 0 6px 0;">
                 <b>标的：</b>{stock['ticker']} ({stock['company']}) ｜ <b>分类：</b>{category} ｜ <b>重要度：{score}/10</b>
+              </p>
+              <p style="margin:0 0 10px 0;font-size:13px;">
+                🕒 <b>{html.escape(time_label)}：</b>{html.escape(pub_time_str)}<br/>
+                📡 <b>原始信源 ({html.escape(source_tier)})：</b>{html.escape(ev['source'])}
               </p>
               <div style="border-left:3px solid #888;padding-left:10px;margin:10px 0;">
                 <b>【英文原标题】</b><br/>{html.escape(ev['title'])}
@@ -741,7 +909,7 @@ def main():
               <div style="margin:10px 0;font-size:14px;white-space:pre-wrap;"><b>【中文翻译正文】</b>\n{html.escape(body_cn)}</div>
               <hr style="border:none;border-top:1px solid #555;margin:10px 0;"/>
               <p style="margin:6px 0;font-size:13px;">
-                来源：{html.escape(ev['source'])} ｜ <a href="{ev['url']}">👉 点击查看英文原文出处</a>
+                <a href="{ev['url']}">👉 点击查看英文原文完整出处</a>
               </p>
             </div>
             """
@@ -751,7 +919,10 @@ def main():
             deep_text = "未达深度解读阈值（仅推送基础事实与原文翻译）"
             if score >= threshold:
                 time.sleep(2)
-                stock_vault_notes = vault_knowledge.get(stock["ticker"], [])
+                stock_vault_notes = list(vault_knowledge.get(stock["ticker"], []))
+                # 若同赛道持仓（如 MANE 与 ABSI 同属脱发 AGA 赛道）在投研库中有竞品对标底稿，自动联动载入
+                if stock["ticker"] == "MANE" and "ABSI" in vault_knowledge:
+                    stock_vault_notes.extend(vault_knowledge["ABSI"])
                 deep_text, deep_model = gemini_deep_analysis(
                     ev, facts, api_key, vault_notes=stock_vault_notes
                 )
@@ -761,7 +932,9 @@ def main():
                 <div style="font-family:sans-serif;line-height:1.7;font-size:14px;">
                   <p style="margin:0 0 8px 0;font-size:13px;">
                     <b>关联事件：</b>{html.escape(title_cn)}<br/>
-                    <b>推理引擎：</b>{deep_model} + ClinicalTrials.gov 官方试验库{vault_badge}
+                    🕒 <b>{html.escape(time_label)}：</b>{html.escape(pub_time_str)}<br/>
+                    📡 <b>原始信源：</b>{html.escape(ev['source'])}<br/>
+                    🧠 <b>推理引擎：</b>{deep_model} + ClinicalTrials.gov 官方试验库{vault_badge}
                   </p>
                   <hr style="border:none;border-top:1px solid #555;margin:10px 0;"/>
                   <div style="white-space:pre-wrap;font-size:14px;">{deep_text}</div>
@@ -781,10 +954,10 @@ def main():
             [
                 bj_time,
                 stock["ticker"],
-                ev["source"],
+                f"{ev['source']} | 发布于 {pub_time_str}",
                 category,
                 score,
-                f"【英文原标题】{ev['title']}\n【中文翻译标题】{title_cn}\n【中文翻译正文】{body_cn}",
+                f"【{time_label}】{pub_time_str}\n【原始信源】{ev['source']}\n【英文原标题】{ev['title']}\n【中文翻译标题】{title_cn}\n【中文翻译正文】{body_cn}",
                 deep_text,
                 f"{ev['title']} ({ev['url']})",
                 ev["id"],
