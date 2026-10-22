@@ -87,9 +87,30 @@ def clean_boilerplate_text(text):
     return cleaned
 
 
+def _format_html_tables(html_str):
+    """将 HTML 表格中的每一行 <tr> 压缩为清晰的 | 分隔单行文本，防止单元格内 <p>/<div> 把表格切碎成上百行"""
+    def repl_tr(m):
+        tr_inner = m.group(1)
+        cells = re.findall(r"(?is)<t[dh]\b[^>]*>(.*?)</t[dh]>", tr_inner)
+        if not cells:
+            return "\n"
+        cleaned_cells = []
+        for c in cells:
+            c_txt = re.sub(r"<[^>]+>", " ", c)
+            c_txt = html.unescape(c_txt).replace("\xa0", " ")
+            c_txt = re.sub(r"\s+", " ", c_txt).strip()
+            if c_txt:
+                cleaned_cells.append(c_txt)
+        if not cleaned_cells:
+            return ""
+        return "\n| " + " | ".join(cleaned_cells) + " |\n"
+
+    return re.sub(r"(?is)<tr\b[^>]*>(.*?)</tr>", repl_tr, html_str)
+
+
 def html_to_text(raw):
     """
-    HTML 转纯文本。注意顺序：必须【先去标签、后反转义】。
+    HTML 转纯文本。注意顺序：必须【先处理表格与块级标签、再去行内标签、最后反转义】。
     旧版先 unescape 再去标签，会把 'p&lt;0.0001' 变成 'p<0.0001 ...>' 后被当作标签整段吞掉，
     导致临床新闻稿里所有 p 值及其后的数据全部丢失。
     """
@@ -97,21 +118,27 @@ def html_to_text(raw):
         return ""
     s = re.sub(r"(?is)<(script|style|head|noscript)[^>]*>.*?</\1>", " ", raw)
     s = re.sub(r"(?is)<!--.*?-->", " ", s)
-    # 块级元素 -> 换行；表格单元格 -> 分隔符；其余行内标签直接去掉（保持 'p<0.0001' 连续）
+    # 剥离 SEC EDGAR SGML 头部标签 (如 <TYPE>EX-99.1 <SEQUENCE>2 <FILENAME>...)
+    s = re.sub(r"(?im)^<(TYPE|SEQUENCE|FILENAME|DESCRIPTION)>[^\n]*\n?", "", s)
+    # 先把表格行 <tr>...</tr> 格式化为单行 | col1 | col2 |
+    s = _format_html_tables(s)
+    # 块级元素 -> 换行；其余行内标签直接去掉（保持 'p<0.0001' 连续）
     s = re.sub(r"(?i)<br\s*/?>", "\n", s)
-    s = re.sub(r"(?i)</?(p|div|tr|li|ul|ol|h[1-6]|table|section|article|blockquote)\b[^>]*>", "\n", s)
-    s = re.sub(r"(?i)</t[dh]\s*>", " | ", s)
+    s = re.sub(r"(?i)</?(p|div|li|ul|ol|h[1-6]|table|section|article|blockquote)\b[^>]*>", "\n", s)
     s = re.sub(r"<[^>]+>", "", s)
     s = html.unescape(s).replace("\xa0", " ")
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r" *\n *", "\n", s)
-    s = re.sub(r"(\s*\|\s*){2,}", " | ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
+    # 清理残余的 SEC Exhibit 文件头行
+    lines = s.strip().splitlines()
+    while lines and re.match(r"(?i)^(ex-?99\.\d+|exhibit\s*99\.\d+|\d+|[\w\-]+\.htm[l]?)$", lines[0].strip()):
+        lines.pop(0)
+    return "\n".join(lines).strip()
 
 
-def fetch_webpage_plain_text(url, is_sec=False, max_chars=6000):
-    """抓取公告或新闻原文正文"""
+def fetch_webpage_plain_text(url, is_sec=False, max_chars=25000):
+    """抓取公告或新闻原文完整正文（默认保留高达 25,000 字符，完整覆盖整篇新闻稿）"""
     if not url or "news.google.com/rss/articles" in url:
         return ""
     try:
@@ -121,9 +148,14 @@ def fetch_webpage_plain_text(url, is_sec=False, max_chars=6000):
             else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
-        raw = re.sub(r"(?is)<(nav|footer)[^>]*>.*?</\1>", " ", raw)
+        # 对于 Yahoo Finance 等外部媒体网页，优先提取 <article> 主体，剥离顶部大盘指数导航栏噪音
+        if not is_sec:
+            art_m = re.search(r"(?is)<article\b[^>]*>(.*?)</article>", raw)
+            if art_m and len(art_m.group(1)) > 400:
+                raw = art_m.group(1)
+        raw = re.sub(r"(?is)<(nav|footer|header)[^>]*>.*?</\1>", " ", raw)
         return clean_boilerplate_text(html_to_text(raw))[:max_chars]
     except Exception:
         return ""
@@ -303,7 +335,7 @@ SEC_8K_ITEMS_CN = {
 }
 
 
-def fetch_sec_press_exhibits(cik_int, acc_no_hyphen, max_chars=15000):
+def fetch_sec_press_exhibits(cik_int, acc_no_hyphen, max_chars=25000):
     """读取 8-K 的 EX-99.x 附件（公司官方新闻稿全文），返回 (标题, 正文, 链接)"""
     base = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no_hyphen}/"
     try:
@@ -325,14 +357,24 @@ def fetch_sec_press_exhibits(cik_int, acc_no_hyphen, max_chars=15000):
     if not texts:
         return "", "", ""
     full = "\n\n".join(texts)[:max_chars]
-    # 标题：跳过 EX-99.1 / 文件名 / 页码等表头，取首个实质句
-    headline = ""
+    # 标题提取：跳过 EX-99.1 / 文件名 / 页码等表头，合并被 HTML 换行切碎的多行主标题
+    headline_parts = []
     for line in texts[0].splitlines():
         ln = line.strip()
-        if len(ln) < 25 or re.match(r"(?i)^(ex-?99|exhibit\s*99|\d+$|.*\.htm$)", ln):
+        if not ln or re.match(r"(?i)^(ex-?99|exhibit\s*99|\d+$|.*\.htm[l]?$)", ln):
             continue
-        headline = ln[:220]
-        break
+        if not headline_parts:
+            if len(ln) < 20:
+                continue
+            headline_parts.append(ln)
+            # 若首行以介词/连词结尾（如 'in', 'of', 'for', 'to', 'with', 'from', 'and'）或不足 95 字符，继续拼接下一行标题
+            if not re.search(r"(?i)\b(in|of|for|to|with|from|at|on|and|by|as|into)$", ln) and len(ln) > 95:
+                break
+        else:
+            if len(ln) < 120 and not ln.endswith("."):
+                headline_parts.append(ln)
+            break
+    headline = " ".join(headline_parts)[:260]
     return headline, full, base + ex_files[0]
 
 
@@ -468,7 +510,7 @@ def fetch_yahoo_direct_news(stock, max_age_hours=24):
             return events
 
         now_utc = datetime.datetime.now(datetime.timezone.utc)
-        for item in channel.findall("item")[:5]:
+        for item in channel.findall("item")[:15]:
             title = (item.findtext("title") or "").strip()
             link = (item.findtext("link") or "").strip()
             guid = (item.findtext("guid") or link).strip()
@@ -490,20 +532,33 @@ def fetch_yahoo_direct_news(stock, max_age_hours=24):
             if not is_strict_match_for_stock(f"{title} {desc}", stock):
                 continue
 
-            full_text = fetch_webpage_plain_text(link, is_sec=False, max_chars=7500)
+            full_text = fetch_webpage_plain_text(link, is_sec=False, max_chars=25000)
             body_en = full_text if len(full_text) > len(desc) else desc
             if not has_substantive_body(title, body_en):
                 # 无实质正文的空壳链接不推送
                 continue
 
-            pub_name = source_tag or "Yahoo Finance 聚合通稿"
+            # 自动识别是否为公司官方公关通稿 (Business Wire / GlobeNewswire / PR Newswire / Accesswire)
+            wire_match = re.search(
+                r"(?i)\b(BUSINESS WIRE|GLOBE NEWSWIRE|GlobeNewswire|PR Newswire|PRNewswire|ACCESSWIRE)\b",
+                body_en[:2500],
+            )
+            if wire_match:
+                wire_name = wire_match.group(1)
+                pub_source = f"公司官方新闻稿 ({wire_name} / Yahoo Finance)"
+                tier = "一手官方新闻稿 (News Release)"
+            else:
+                pub_name = source_tag or "Yahoo Finance 财经报道"
+                pub_source = f"财经媒体报道：{pub_name}"
+                tier = "外部财经媒体"
+
             short_hash = hashlib.sha1(guid.encode("utf-8")).hexdigest()[:16]
             events.append(
                 {
                     "id": f"YF_{stock['ticker']}_{short_hash}",
                     "stock": stock,
-                    "source": f"新闻通稿：{pub_name}",
-                    "source_tier": "一手通稿/媒体",
+                    "source": pub_source,
+                    "source_tier": tier,
                     "published_at": dt,
                     "time_label": "原始发布时间",
                     "title": title,
@@ -511,6 +566,8 @@ def fetch_yahoo_direct_news(stock, max_age_hours=24):
                     "url": link,
                 }
             )
+        # 优先将公司一手官方新闻稿 (News Release) 排在普通媒体报道之前
+        events.sort(key=lambda x: 0 if "一手官方新闻稿" in x.get("source_tier", "") else 1)
     except Exception as e:
         print(f"[WARN] Yahoo RSS failed for {stock['ticker']}: {e}")
     return events
@@ -658,7 +715,10 @@ def call_gemini(api_key, prompt, expect_json=False, use_search=False, deep_think
                 f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
                 f"?key={urllib.parse.quote(cur_key)}"
             )
-            gen_cfg = {"temperature": 0.1 if expect_json else 0.15}
+            gen_cfg = {
+                "temperature": 0.1 if expect_json else 0.15,
+                "maxOutputTokens": 16384,
+            }
             if expect_json:
                 gen_cfg["responseMimeType"] = "application/json"
             if deep_thinking:
@@ -672,7 +732,7 @@ def call_gemini(api_key, prompt, expect_json=False, use_search=False, deep_think
                 payload["tools"] = [{"google_search": {}}]
 
             try:
-                resp = http_json(url, method="POST", payload=payload, timeout=60)
+                resp = http_json(url, method="POST", payload=payload, timeout=120)
                 _GEMINI_KEY_IDX = (_GEMINI_KEY_IDX + attempt + 1) % len(keys)
                 candidates = resp.get("candidates", [])
                 if candidates and "content" in candidates[0]:
@@ -687,7 +747,7 @@ def call_gemini(api_key, prompt, expect_json=False, use_search=False, deep_think
                         return text, label
             except urllib.error.HTTPError as e:
                 print(f"[WARN] Gemini key#{attempt+1} model {model} HTTP {e.code}: {e}")
-                if e.code == 429:
+                if e.code in (429, 503):
                     time.sleep(1.5)
                     continue
             except Exception as e:
@@ -697,48 +757,72 @@ def call_gemini(api_key, prompt, expect_json=False, use_search=False, deep_think
 
 def gemini_translate_facts(ev, api_key):
     """
-    阶段一：纯粹的【基础事实提取与中译】
-    严格提供：1. 英文原标题；2. 中文翻译标题；3. 中文翻译正文（剔除一切广告/页脚）
+    阶段一：100% 完整全文精译（严禁概括总结！）
+    严格提供：1. 英文原标题；2. 中文翻译标题；3. 【核心亮点 Highlights】逐条精译 + 【完整新闻稿正文与临床数据表格】逐段逐表完整翻译
+    采用纯文本标签分隔（不使用 JSON 字符串包裹长文，彻底杜绝因引号/换行转义导致的 JSON 解析失败或被模型擅自缩写成摘要）
     """
     stock = ev["stock"]
-    prompt = f"""请对以下关于生物科技公司 {stock['ticker']} ({stock['company']}) 的最新英文资料进行关联核实与精准中文翻译。
+    prompt = f"""请将以下关于生物科技公司 {stock['ticker']} ({stock['company']}) 的最新英文稿件进行 100% 完整、逐条、逐段、逐表的简体中文全文翻译。
 
 【来源】：{ev['source']}
 【英文原标题】：{ev['title']}
-【英文原始正文】：
+【英文原始全文】：
 {ev['body_en']}
 
-⚠️ 严格要求：
-1. 若该资料实际主语不是 {stock['company']} ({stock['ticker']}) 或其研发管线（例如误抓了其他同名公司），请将 `is_relevant` 设为 false，`impact_score` 设为 1。
-2. 全文严禁出现“美股、炒股、买入、卖出、加仓、减仓、止盈、止损、暴涨、暴跌、基金经理、交易建议”等敏感字眼。
-3. `title_cn`：将【英文原标题】精准直译为简体中文。
-4. `body_cn`：将【英文原始正文】中的实质内容完整、准确、逐段翻译为简体中文（100%保留所有实验数据、p值、百分比、剂量、样本量N、金额与日期；彻底忽略并剔除任何残余的网站广告、其他文章推荐、免责声明或取消订阅提示；如果原始正文仅仅是把标题重复了一遍而没有实质正文段落，请直接写“（该快讯仅含标题，尚无详细正文段落，请点击下方链接查看）”）。
+⚠️ 铁律要求（违反任何一条均为不合格）：
+1. **严禁总结、严禁缩写、严禁省略任何段落或数据！** 必须对英文原稿进行从头到尾的**完整全文翻译**，绝不允许把几千字的新闻稿概括成几百字的摘要！
+2. **第一部分【核心要点 (Highlights)】（若原稿有）**：新闻稿标题下方、正式电头（如 `CITY, State -- (BUSINESS WIRE / GLOBE NEWSWIRE) -- Date`）之前通常有若干条核心亮点导语（Highlights）。你必须首先在 `【核心要点 (Highlights)】` 标题下，用 `• ` **逐条、完整、一字不漏地翻译每一条 Highlight**（100%保留所有实验数据、终点名称、剂量组、百分比、p值与时间点）。
+3. **第二部分【新闻稿完整正文与数据表格】**：
+   - 从电头（如 `康涅狄格州纽黑文 -- (美国商业资讯) -- 2026年10月19日 -- ...`）开始，严格按照英文原稿的自然段落顺序，**逐段完整直译每一段正文**。
+   - **完整还原所有数据表格（如 Table 1、Table 2 等）**：严禁用文字概述表格！必须将原稿中的每一个表格完整翻译为清晰的中文对照表（保留表头、每一行指标、每一个剂量组数值、安慰剂数值、不良反应发生率、停药率与 p 值）。
+   - **完整翻译所有高管与临床专家（KOL）引语**：管理层与外部医学专家的每一段发言必须完整逐句翻译，不得删减。
+   - **完整翻译关于药物/临床项目/适应症/公司的背景段落（About ...）**：文末的 `About [Drug]`、`About the Clinical Program`、`About [Condition]`、`About [Company]` 段落也必须完整翻译（仅剔除 `Forward-Looking Statements` 法律免责套话及网站导航广告）。
+4. 若该资料实际主语不是 {stock['company']} ({stock['ticker']}) 或其研发管线（例如误抓了其他无关公司），请将 `[RELEVANT]` 设为 `NO`，`[SCORE]` 设为 `1`。
+5. 全文严禁出现“美股、炒股、买入、卖出、加仓、减仓、止盈、止损、暴涨、暴跌、基金经理、交易建议”等敏感字眼。
 
-请严格按以下 JSON 格式返回（只输出纯 JSON）：
-{{
-  "is_relevant": true,
-  "category": "从以下选一：临床数据 / 合作与并购 / 内部人变动 / 监管与上市 / 事项预告 / 经营业绩 / 行业报道 / 常规行政",
-  "impact_score": 1到10的整数（1-3=无关或例行行政事项；4-6=一般行业报道或常规动态；7-8=重要管线进展/会议数据预告/管理层主动增持/合作里程碑；9-10=关键临床II/III期顶线数据/监管获批或CRL/收购并购）,
-  "title_cn": "中文翻译标题",
-  "body_cn": "中文翻译正文（分段清晰，保留全部数据与关键事实）"
-}}"""
+请严格按照以下纯文本标签格式输出（不要输出 Markdown 代码块包裹）：
+[RELEVANT]: YES 或 NO
+[CATEGORY]: 从以下选一：临床数据 / 合作与并购 / 内部人变动 / 监管与上市 / 事项预告 / 经营业绩 / 行业报道 / 常规行政
+[SCORE]: 1到10的整数（1-3=无关或例行行政；4-6=一般报道；7-8=重要管线进展/会议预告/管理层增持/合作里程碑；9-10=关键临床II/III期顶线数据/监管获批或CRL/收购并购）
+[TITLE_CN]: 完整精准直译的中文标题
+[BODY_CN_START]
+（在此处输出包含【核心要点 (Highlights)】+【新闻稿完整正文与数据表格】的 100% 完整全文中文翻译）
+[BODY_CN_END]"""
+
     raw, used_model = call_gemini(
-        api_key, prompt, expect_json=True, use_search=False, models=GEMINI_TRIAGE_MODELS
+        api_key, prompt, expect_json=False, use_search=False, models=GEMINI_TRIAGE_MODELS
     )
     if raw:
+        rel_m = re.search(r"\[RELEVANT\]:\s*(YES|NO|TRUE|FALSE)", raw, re.I)
+        cat_m = re.search(r"\[CATEGORY\]:\s*([^\n\r]+)", raw)
+        score_m = re.search(r"\[SCORE\]:\s*(\d+)", raw)
+        title_m = re.search(r"\[TITLE_CN\]:\s*([^\n\r]+)", raw)
+        body_m = re.search(r"\[BODY_CN_START\]\s*(.*?)\s*(?:\[BODY_CN_END\]|$)", raw, re.S)
+
+        is_rel = True
+        if rel_m and rel_m.group(1).upper() in ("NO", "FALSE"):
+            is_rel = False
+        cat = cat_m.group(1).strip() if cat_m else "临床数据"
         try:
-            cleaned = re.sub(r"^```json\s*|\s*```$", "", raw.strip())
-            res = json.loads(cleaned)
-            res["_model"] = used_model
-            return res
-        except Exception as e:
-            print(f"[WARN] Parse JSON failed: {e}")
+            sc = int(score_m.group(1)) if score_m else 8
+        except Exception:
+            sc = 8
+        t_cn = title_m.group(1).strip() if title_m else ev["title"]
+        b_cn = body_m.group(1).strip() if body_m else raw.strip()
+        return {
+            "is_relevant": is_rel,
+            "category": cat,
+            "impact_score": sc,
+            "title_cn": t_cn,
+            "body_cn": b_cn,
+            "_model": used_model,
+        }
     return {
         "is_relevant": True,
         "category": "最新动态",
         "impact_score": 7,
         "title_cn": ev["title"],
-        "body_cn": ev["body_en"][:1500],
+        "body_cn": ev["body_en"][:3000],
         "_model": "fallback",
     }
 
