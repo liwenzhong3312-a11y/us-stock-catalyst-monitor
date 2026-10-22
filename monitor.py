@@ -407,9 +407,12 @@ def fetch_sec_press_exhibits(cik_int, acc_no_hyphen, max_chars=25000):
         lm = (it.get("last-modified") or "").strip()
         if lm:
             try:
-                from zoneinfo import ZoneInfo
                 naive_dt = datetime.datetime.strptime(lm, "%Y-%m-%d %H:%M:%S")
-                real_et_dt = naive_dt.replace(tzinfo=ZoneInfo("America/New_York"))
+                # 美东夏令时 (3月-11月初) UTC-4，冬令时 UTC-5（不依赖外部 tzdata 库）
+                et_offset = -4 if 3 <= naive_dt.month <= 10 else -5
+                real_et_dt = naive_dt.replace(
+                    tzinfo=datetime.timezone(datetime.timedelta(hours=et_offset), name="EDT" if et_offset == -4 else "EST")
+                )
                 break
             except Exception:
                 pass
