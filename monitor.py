@@ -88,24 +88,77 @@ def clean_boilerplate_text(text):
 
 
 def _format_html_tables(html_str):
-    """将 HTML 表格中的每一行 <tr> 压缩为清晰的 | 分隔单行文本，注意此处绝不提前调用 html.unescape"""
-    def repl_tr(m):
-        tr_inner = m.group(1)
-        cells = re.findall(r"(?is)<t[dh]\b[^>]*>(.*?)</t[dh]>", tr_inner)
-        if not cells:
+    """
+    将 HTML <table> 解析为严格的二维网格（完整还原 colspan 跨列与 rowspan 跨行合并），
+    杜绝因忽略空单元格或跨列属性导致表头与数据列错位（如把 304 BID 错对齐到 302 表头下）。
+    """
+    def repl_table(t_match):
+        table_inner = t_match.group(1)
+        tr_list = re.findall(r"(?is)<tr\b[^>]*>(.*?)</tr>", table_inner)
+        if not tr_list:
             return "\n"
-        cleaned_cells = []
-        for c in cells:
-            # 仅剥离以字母/!开头的真实 HTML 标签，绝不触碰 <0.0001 等数学符号，且不提前 unescape
-            c_txt = re.sub(r"</?[a-zA-Z!][^>]*>", " ", c)
-            c_txt = re.sub(r"\s+", " ", c_txt).strip()
-            if c_txt:
-                cleaned_cells.append(c_txt)
-        if not cleaned_cells:
-            return ""
-        return "\n| " + " | ".join(cleaned_cells) + " |\n"
+        # 解析每一行的 (文本, colspan, rowspan)
+        parsed_rows = []
+        for tr in tr_list:
+            cell_matches = re.findall(r"(?is)<t[dh]\b([^>]*)>(.*?)</t[dh]>", tr)
+            if not cell_matches:
+                continue
+            row_cells = []
+            for attrs, c_body in cell_matches:
+                c_txt = re.sub(r"</?[a-zA-Z!][^>]*>", " ", c_body)
+                c_txt = re.sub(r"\s+", " ", c_txt).strip()
+                cs_m = re.search(r'(?i)colspan\s*=\s*["\']?(\d+)', attrs)
+                rs_m = re.search(r'(?i)rowspan\s*=\s*["\']?(\d+)', attrs)
+                cs = max(1, min(int(cs_m.group(1)), 40)) if cs_m else 1
+                rs = max(1, min(int(rs_m.group(1)), 40)) if rs_m else 1
+                row_cells.append((c_txt, cs, rs))
+            if any(txt for txt, _, _ in row_cells):
+                parsed_rows.append(row_cells)
 
-    return re.sub(r"(?is)<tr\b[^>]*>(.*?)</tr>", repl_tr, html_str)
+        if not parsed_rows:
+            return "\n"
+
+        # 展开 colspan 与 rowspan 到二维网格 grid[r][c]
+        num_rows = len(parsed_rows)
+        grid = {}
+        max_col = 0
+        for r_idx, row_cells in enumerate(parsed_rows):
+            c_idx = 0
+            for txt, cs, rs in row_cells:
+                while (r_idx, c_idx) in grid:
+                    c_idx += 1
+                for dr in range(rs):
+                    for dc in range(cs):
+                        if r_idx + dr < num_rows:
+                            grid[(r_idx + dr, c_idx + dc)] = txt
+                c_idx += cs
+                if c_idx > max_col:
+                    max_col = c_idx
+
+        # 剔除完全空白的冗余列，并合并 Workiva/SEC 表格中因 colspan=3 产生的完全相同的相邻重复列向量
+        non_empty_cols = [
+            c for c in range(max_col)
+            if any(grid.get((r, c), "").strip() for r in range(num_rows))
+        ]
+        valid_cols = []
+        prev_vec = None
+        for c in non_empty_cols:
+            vec = tuple(grid.get((r, c), "").strip() for r in range(num_rows))
+            if vec != prev_vec:
+                valid_cols.append(c)
+                prev_vec = vec
+        if not valid_cols:
+            return "\n"
+
+        out_lines = [""]
+        for r in range(num_rows):
+            row_vals = [grid.get((r, c), "").strip() for c in valid_cols]
+            if any(row_vals):
+                out_lines.append("| " + " | ".join(row_vals) + " |")
+        out_lines.append("")
+        return "\n".join(out_lines)
+
+    return re.sub(r"(?is)<table\b[^>]*>(.*?)</table>", repl_table, html_str)
 
 
 def html_to_text(raw):
@@ -794,7 +847,7 @@ def gemini_translate_facts(ev, api_key):
 2. **第一部分【核心要点 (Highlights)】（若原稿有）**：新闻稿标题下方、正式电头（如 `CITY, State -- (BUSINESS WIRE / GLOBE NEWSWIRE) -- Date`）之前通常有若干条核心亮点导语（Highlights）。你必须首先在 `【核心要点 (Highlights)】` 标题下，用 `• ` **逐条、完整、一字不漏地翻译每一条 Highlight**（100%保留所有实验数据、终点名称、剂量组、百分比、p值与时间点）。
 3. **第二部分【新闻稿完整正文与数据表格】**：
    - 从电头（如 `康涅狄格州纽黑文 -- (美国商业资讯) -- 2026年10月19日 -- ...`）开始，严格按照英文原稿的自然段落顺序，**逐段完整直译每一段正文**。
-   - **完整还原所有数据表格（如 Table 1、Table 2 等）**：严禁用文字概述表格！必须将原稿中的每一个表格完整翻译为清晰的中文对照表（保留表头、每一行指标、每一个剂量组数值、安慰剂数值、不良反应发生率、停药率与 p 值）。
+   - **完整还原所有数据表格（如 Table 1、Table 2 等）**：严禁用文字概述表格！英文原稿中的表格已展开为等宽列网格（每一行的 `|` 分隔单元格数量完全相等，跨列表头已按列重复展开，跨行分类已在首列重复展开）。你在翻译表格时，**每一行的 `|` 单元格总数必须与英文原表每一行的单元格总数 100% 严格相等**（例如原表第一行有 3 个重复的 `New Study '304' Topline` 对应下方的 `QD | BID | Placebo`，你也必须在第一行保留对应的空单元格及 3 个重复的 `新“304”研究顶线数据` 单元格；原表首列若有重复的跨行分类名称，也必须在每一行首列保留），以便下游渲染引擎自动合并生成完美的 `colspan` 跨列表头与 `rowspan` 跨行单元格！
    - **完整翻译所有高管与临床专家（KOL）引语**：管理层与外部医学专家的每一段发言必须完整逐句翻译，不得删减。
    - **完整翻译关于药物/临床项目/适应症/公司的背景段落（About ...）**：文末的 `About [Drug]`、`About the Clinical Program`、`About [Condition]`、`About [Company]` 段落也必须完整翻译（仅剔除 `Forward-Looking Statements` 法律免责套话及网站导航广告）。
 4. 若该资料实际主语不是 {stock['company']} ({stock['ticker']}) 或其研发管线（例如误抓了其他无关公司），请将 `[RELEVANT]` 设为 `NO`，`[SCORE]` 设为 `1`。
@@ -901,7 +954,11 @@ def gemini_deep_analysis(ev, facts, api_key, vault_notes=None):
 
 
 def format_body_for_wechat_html(text):
-    """将含 Markdown 表格与粗体的纯文本安全转换为微信深色/浅色模式自适应的 HTML（表格转为带边框的原生 <table>）"""
+    """
+    将含 Markdown 表格与粗体的纯文本安全转换为微信深色/浅色模式自适应的 HTML。
+    智能还原表格的 colspan（跨列表头居中合并）与 rowspan（首列跨行分类合并），
+    并自动修复列数不足的表头行，彻底杜绝表头与数据列错位。
+    """
     if not text:
         return ""
     lines = text.splitlines()
@@ -912,22 +969,101 @@ def format_body_for_wechat_html(text):
         nonlocal table_rows
         if not table_rows:
             return
+        parsed = []
+        for row in table_rows:
+            cells = [c.strip() for c in row.strip().strip("|").split("|")]
+            if all(re.match(r"^[:\-\s]*$", c) for c in cells):
+                continue
+            parsed.append(cells)
+        if not parsed:
+            table_rows = []
+            return
+
+        max_cols = max(len(r) for r in parsed)
+        # 自动对齐修复：若某表头行单元格数少于 max_cols（例如模型未重复跨列表头），自动按组展开对齐到 max_cols
+        norm_rows = []
+        for r_idx, r in enumerate(parsed):
+            if len(r) < max_cols:
+                non_empty = [c for c in r if c]
+                empty_cnt = len(r) - len(non_empty)
+                # 检查下一行开头有几个空单元格作为左侧指标列宽度参考
+                label_cols = max(1, empty_cnt)
+                if r_idx + 1 < len(parsed):
+                    nxt_empty = 0
+                    for c in parsed[r_idx + 1]:
+                        if not c:
+                            nxt_empty += 1
+                        else:
+                            break
+                    if nxt_empty > label_cols:
+                        label_cols = nxt_empty
+                rem = max_cols - label_cols
+                if non_empty and rem > 0 and rem % len(non_empty) == 0:
+                    span = rem // len(non_empty)
+                    new_r = [""] * label_cols
+                    for item in non_empty:
+                        new_r.extend([item] * span)
+                    r = new_r
+                else:
+                    r = r + [""] * (max_cols - len(r))
+            norm_rows.append(r[:max_cols])
+
+        num_r = len(norm_rows)
+        # 计算首列 (col=0) 的垂直跨行合并 rowspan（当总列数 >= 7 且首列相邻非空文本完全相同时合并）
+        skip_cell = set()
+        rowspan_map = {}
+        if max_cols >= 7:
+            r = 0
+            while r < num_r:
+                val = norm_rows[r][0]
+                if val and r >= 1:
+                    rs = 1
+                    while r + rs < num_r and norm_rows[r + rs][0] == val:
+                        skip_cell.add((r + rs, 0))
+                        rs += 1
+                    if rs > 1:
+                        rowspan_map[(r, 0)] = rs
+                    r += rs
+                else:
+                    r += 1
+
         t_html = [
             '<div style="overflow-x:auto;margin:8px 0;"><table style="width:100%;border-collapse:collapse;font-size:12.5px;line-height:1.5;">'
         ]
-        for r_idx, row in enumerate(table_rows):
-            cells = [c.strip() for c in row.strip().strip("|").split("|")]
-            # 跳过纯分隔行 | :--- | :---: |
-            if all(re.match(r"^[:\-\s]*$", c) for c in cells):
-                continue
+        for r_idx, r in enumerate(norm_rows):
             t_html.append("<tr>")
-            tag = "th" if r_idx == 0 else "td"
-            for c in cells:
-                c_esc = html.escape(c)
+            is_header = (r_idx == 0) or (r_idx == 1 and not r[0])
+            tag = "th" if is_header else "td"
+            c_idx = 0
+            while c_idx < max_cols:
+                if (r_idx, c_idx) in skip_cell:
+                    c_idx += 1
+                    continue
+                val = r[c_idx]
+                # 在表头行（或连续空表头格）自动水平合并相邻同值单元格为 colspan
+                cs = 1
+                if is_header:
+                    while (
+                        c_idx + cs < max_cols
+                        and (r_idx, c_idx + cs) not in skip_cell
+                        and r[c_idx + cs] == val
+                        and (val != "" or c_idx + cs < 2)
+                    ):
+                        cs += 1
+                rs = rowspan_map.get((r_idx, c_idx), 1)
+                c_esc = html.escape(val)
                 c_esc = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", c_esc)
+                attrs = []
+                if cs > 1:
+                    attrs.append(f'colspan="{cs}"')
+                if rs > 1:
+                    attrs.append(f'rowspan="{rs}"')
+                align = "center" if (is_header and val) else "left"
+                attr_str = (" " + " ".join(attrs)) if attrs else ""
                 t_html.append(
-                    f'<{tag} style="border:1px solid #666;padding:4px 6px;text-align:left;">{c_esc}</{tag}>'
+                    f'<{tag}{attr_str} style="border:1px solid #666;padding:4px 6px;text-align:{align};vertical-align:middle;">{c_esc}</{tag}>'
                 )
+                c_idx += cs
             t_html.append("</tr>")
         t_html.append("</table></div>")
         out_parts.append("".join(t_html))
