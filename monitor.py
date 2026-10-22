@@ -88,7 +88,7 @@ def clean_boilerplate_text(text):
 
 
 def _format_html_tables(html_str):
-    """将 HTML 表格中的每一行 <tr> 压缩为清晰的 | 分隔单行文本，防止单元格内 <p>/<div> 把表格切碎成上百行"""
+    """将 HTML 表格中的每一行 <tr> 压缩为清晰的 | 分隔单行文本，注意此处绝不提前调用 html.unescape"""
     def repl_tr(m):
         tr_inner = m.group(1)
         cells = re.findall(r"(?is)<t[dh]\b[^>]*>(.*?)</t[dh]>", tr_inner)
@@ -96,8 +96,8 @@ def _format_html_tables(html_str):
             return "\n"
         cleaned_cells = []
         for c in cells:
-            c_txt = re.sub(r"<[^>]+>", " ", c)
-            c_txt = html.unescape(c_txt).replace("\xa0", " ")
+            # 仅剥离以字母/!开头的真实 HTML 标签，绝不触碰 <0.0001 等数学符号，且不提前 unescape
+            c_txt = re.sub(r"</?[a-zA-Z!][^>]*>", " ", c)
             c_txt = re.sub(r"\s+", " ", c_txt).strip()
             if c_txt:
                 cleaned_cells.append(c_txt)
@@ -110,9 +110,10 @@ def _format_html_tables(html_str):
 
 def html_to_text(raw):
     """
-    HTML 转纯文本。注意顺序：必须【先处理表格与块级标签、再去行内标签、最后反转义】。
-    旧版先 unescape 再去标签，会把 'p&lt;0.0001' 变成 'p<0.0001 ...>' 后被当作标签整段吞掉，
-    导致临床新闻稿里所有 p 值及其后的数据全部丢失。
+    HTML 转纯文本。
+    双重安全保障：
+    1. 正则仅匹配真实 HTML 标签 `</?[a-zA-Z!][^>]*>`（绝不把 `<0.0001` 或 `< 0.05` 当作标签）；
+    2. 严格在剥离完所有 HTML 标签之后，最后一步才执行一次 `html.unescape()`。
     """
     if not raw:
         return ""
@@ -122,10 +123,11 @@ def html_to_text(raw):
     s = re.sub(r"(?im)^<(TYPE|SEQUENCE|FILENAME|DESCRIPTION)>[^\n]*\n?", "", s)
     # 先把表格行 <tr>...</tr> 格式化为单行 | col1 | col2 |
     s = _format_html_tables(s)
-    # 块级元素 -> 换行；其余行内标签直接去掉（保持 'p<0.0001' 连续）
+    # 块级元素 -> 换行；其余真实 HTML 标签直接去掉
     s = re.sub(r"(?i)<br\s*/?>", "\n", s)
     s = re.sub(r"(?i)</?(p|div|li|ul|ol|h[1-6]|table|section|article|blockquote)\b[^>]*>", "\n", s)
-    s = re.sub(r"<[^>]+>", "", s)
+    s = re.sub(r"</?[a-zA-Z!][^>]*>", "", s)
+    # 所有 HTML 标签清理完毕后，最后一步才执行 unescape
     s = html.unescape(s).replace("\xa0", " ")
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r" *\n *", "\n", s)
@@ -880,6 +882,52 @@ def gemini_deep_analysis(ev, facts, api_key, vault_notes=None):
     return (res or "深度解读暂不可用。"), (used_model or "gemini")
 
 
+def format_body_for_wechat_html(text):
+    """将含 Markdown 表格与粗体的纯文本安全转换为微信深色/浅色模式自适应的 HTML（表格转为带边框的原生 <table>）"""
+    if not text:
+        return ""
+    lines = text.splitlines()
+    out_parts = []
+    table_rows = []
+
+    def flush_table():
+        nonlocal table_rows
+        if not table_rows:
+            return
+        t_html = [
+            '<div style="overflow-x:auto;margin:8px 0;"><table style="width:100%;border-collapse:collapse;font-size:12.5px;line-height:1.5;">'
+        ]
+        for r_idx, row in enumerate(table_rows):
+            cells = [c.strip() for c in row.strip().strip("|").split("|")]
+            # 跳过纯分隔行 | :--- | :---: |
+            if all(re.match(r"^[:\-\s]*$", c) for c in cells):
+                continue
+            t_html.append("<tr>")
+            tag = "th" if r_idx == 0 else "td"
+            for c in cells:
+                c_esc = html.escape(c)
+                c_esc = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", c_esc)
+                t_html.append(
+                    f'<{tag} style="border:1px solid #666;padding:4px 6px;text-align:left;">{c_esc}</{tag}>'
+                )
+            t_html.append("</tr>")
+        t_html.append("</table></div>")
+        out_parts.append("".join(t_html))
+        table_rows = []
+
+    for ln in lines:
+        s = ln.strip()
+        if s.startswith("|") and s.endswith("|") and s.count("|") >= 2:
+            table_rows.append(s)
+        else:
+            flush_table()
+            esc = html.escape(ln)
+            esc = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc)
+            out_parts.append(esc)
+    flush_table()
+    return "\n".join(out_parts)
+
+
 def send_pushplus(token, title, html_body):
     if not token or "请在此粘贴" in token:
         return
@@ -993,7 +1041,7 @@ def main():
                 <b>【中文翻译标题】</b><br/><b>{html.escape(title_cn)}</b>
               </div>
               <hr style="border:none;border-top:1px solid #555;margin:10px 0;"/>
-              <div style="margin:10px 0;font-size:14px;white-space:pre-wrap;"><b>【中文翻译正文】</b>\n{html.escape(body_cn)}</div>
+              <div style="margin:10px 0;font-size:14px;white-space:pre-wrap;"><b>【中文全文精译（含全部 Highlights 要点 + 完整正文 + 临床数据表）】</b>\n{format_body_for_wechat_html(body_cn)}</div>
               <hr style="border:none;border-top:1px solid #555;margin:10px 0;"/>
               <p style="margin:6px 0;font-size:13px;">
                 <a href="{ev['url']}">👉 点击查看英文原文完整出处</a>
