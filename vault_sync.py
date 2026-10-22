@@ -32,9 +32,9 @@ SPREADSHEET_ID = os.environ.get(
 )
 
 VAULT_MODELS = [
-    "gemini-3.5-flash",
-    "gemini-3.6-flash",
+    "gemini-flash-latest",
     "gemini-3-flash-preview",
+    "gemini-pro-latest",
 ]
 
 _KEY_INDEX = 0
@@ -466,17 +466,27 @@ def create_bilingual_doc_and_pdf_in_drive(access_token, output_folder_id, base_t
     ).encode("utf-8")
 
     upload_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink"
-    req = urllib.request.Request(
-        upload_url,
-        data=body_parts,
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": f"multipart/related; boundary={boundary}",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        doc_info = json.loads(resp.read().decode("utf-8"))
+    doc_info = None
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                upload_url,
+                data=body_parts,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": f"multipart/related; boundary={boundary}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                doc_info = json.loads(resp.read().decode("utf-8"))
+            if doc_info and "id" in doc_info:
+                break
+        except urllib.error.HTTPError as e:
+            if attempt < 2 and e.code in (500, 502, 503, 504):
+                time.sleep(3 * (attempt + 1))
+                continue
+            raise
 
     doc_id = doc_info["id"]
 
@@ -513,17 +523,27 @@ def create_bilingual_doc_and_pdf_in_drive(access_token, output_folder_id, base_t
         f"Content-Type: application/pdf\r\n\r\n"
     ).encode("utf-8") + pdf_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
 
-    req_pdf = urllib.request.Request(
-        upload_url,
-        data=pdf_multipart,
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": f"multipart/related; boundary={boundary}",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req_pdf, timeout=60) as resp:
-        pdf_info = json.loads(resp.read().decode("utf-8"))
+    pdf_info = None
+    for attempt in range(3):
+        try:
+            req_pdf = urllib.request.Request(
+                upload_url,
+                data=pdf_multipart,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": f"multipart/related; boundary={boundary}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req_pdf, timeout=60) as resp:
+                pdf_info = json.loads(resp.read().decode("utf-8"))
+            if pdf_info and "id" in pdf_info:
+                break
+        except urllib.error.HTTPError as e:
+            if attempt < 2 and e.code in (500, 502, 503, 504):
+                time.sleep(3 * (attempt + 1))
+                continue
+            raise
 
     pdf_link = pdf_info.get("webViewLink", f"https://drive.google.com/file/d/{pdf_info['id']}/view")
     return pdf_link, pdf_link
