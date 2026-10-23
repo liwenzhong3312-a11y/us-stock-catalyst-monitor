@@ -321,7 +321,7 @@ def get_google_access_token():
 
 
 def load_sheet_state(access_token):
-    ranges = ["Portfolio!A2:H50", "Config!A2:B20", "Logs!I2:I500"]
+    ranges = ["Portfolio!A2:H50", "Config!A2:B20", "Logs!H2:I500"]
     q = "&".join(f"ranges={urllib.parse.quote(r)}" for r in ranges)
     url = f"https://sheets.googleapis.com/v4/spreadsheets/{SPREADSHEET_ID}/values:batchGet?{q}"
     res = http_json(url, headers={"Authorization": f"Bearer {access_token}"})
@@ -329,7 +329,7 @@ def load_sheet_state(access_token):
 
     portfolio_rows = value_ranges[0].get("values", []) if len(value_ranges) > 0 else []
     config_rows = value_ranges[1].get("values", []) if len(value_ranges) > 1 else []
-    log_id_rows = value_ranges[2].get("values", []) if len(value_ranges) > 2 else []
+    log_rows = value_ranges[2].get("values", []) if len(value_ranges) > 2 else []
 
     config = {}
     for row in config_rows:
@@ -367,11 +367,17 @@ def load_sheet_state(access_token):
         )
 
     processed_ids = set()
-    for row in log_id_rows:
-        if row and str(row[0]).strip():
-            processed_ids.add(str(row[0]).strip())
+    processed_titles = set()
+    for row in log_rows:
+        if len(row) >= 2 and str(row[1]).strip():
+            processed_ids.add(str(row[1]).strip())
+        if len(row) >= 1 and str(row[0]).strip():
+            raw_h = str(row[0]).strip()
+            clean_h = re.sub(r"\(https?://[^\)]+\)", "", raw_h).strip().lower()
+            if clean_h:
+                processed_titles.add(re.sub(r"[^a-z0-9]+", "", clean_h))
 
-    return config, portfolio, processed_ids
+    return config, portfolio, processed_ids, processed_titles
 
 
 def is_strict_match_for_stock(text, stock):
@@ -980,6 +986,19 @@ def call_gemini(api_key, prompt, expect_json=False, use_search=False, deep_think
     return None, None
 
 
+
+def translate_title_fallback(title, api_key):
+    """当主翻译未提取到中文或大模型限流时，调用超轻量模型秒级单句直译标题，100% 确保标题为中文"""
+    if not title:
+        return ""
+    prompt = f"请将以下美股生物医药通告标题直译为一句精炼中文标题（不要多余解释，只输出中文标题）：\n{title}"
+    text, _ = call_gemini(api_key, prompt, expect_json=False, models=["gemini-3.1-flash-lite", "gemini-flash-latest"])
+    if text:
+        cleaned = re.sub(r"^[\*\"'“”‘’\s]+|[\*\"'“”‘’\s]+$", "", text.strip())
+        if cleaned and re.search(r"[\u4e00-\u9fa5]", cleaned):
+            return cleaned
+    return title
+
 def gemini_translate_facts(ev, api_key):
     """
     阶段一：100% 完整全文精译（严禁概括总结！）
@@ -1018,11 +1037,11 @@ def gemini_translate_facts(ev, api_key):
         api_key, prompt, expect_json=False, use_search=False, models=GEMINI_TRIAGE_MODELS
     )
     if raw:
-        rel_m = re.search(r"\[RELEVANT\]:\s*(YES|NO|TRUE|FALSE)", raw, re.I)
-        cat_m = re.search(r"\[CATEGORY\]:\s*([^\n\r]+)", raw)
-        score_m = re.search(r"\[SCORE\]:\s*(\d+)", raw)
-        title_m = re.search(r"\[TITLE_CN\]:\s*([^\n\r]+)", raw)
-        body_m = re.search(r"\[BODY_CN_START\]\s*(.*?)\s*(?:\[BODY_CN_END\]|$)", raw, re.S)
+        rel_m = re.search(r"\[?\*?\*?RELEVANT\*?\*?\]?[:：]\s*(YES|NO|TRUE|FALSE)", raw, re.I)
+        cat_m = re.search(r"\[?\*?\*?CATEGORY\*?\*?\]?[:：]\s*([^\n\r]+)", raw)
+        score_m = re.search(r"\[?\*?\*?SCORE\*?\*?\]?[:：]\s*(\d+)", raw)
+        title_m = re.search(r"\[?\*?\*?(?:TITLE_CN|中文标题)\*?\*?\]?[:：]\s*([^\n\r]+)", raw, re.I)
+        body_m = re.search(r"\[?\*?\*?(?:BODY_CN_START|正文开始)\*?\*?\]?[:：]?\s*(.*?)\s*(?:\[?\*?\*?(?:BODY_CN_END|正文结束)\*?\*?\]?|$)", raw, re.S | re.I)
 
         is_rel = True
         if rel_m and rel_m.group(1).upper() in ("NO", "FALSE"):
@@ -1032,7 +1051,9 @@ def gemini_translate_facts(ev, api_key):
             sc = int(score_m.group(1)) if score_m else 8
         except Exception:
             sc = 8
-        t_cn = title_m.group(1).strip() if title_m else ev["title"]
+        t_cn = title_m.group(1).strip() if title_m else ""
+        if not t_cn or not re.search(r"[\u4e00-\u9fa5]", t_cn):
+            t_cn = translate_title_fallback(ev["title"], api_key)
         b_cn = body_m.group(1).strip() if body_m else raw.strip()
         return {
             "is_relevant": is_rel,
@@ -1042,11 +1063,14 @@ def gemini_translate_facts(ev, api_key):
             "body_cn": b_cn,
             "_model": used_model,
         }
+
+    # 兜底：即使大模型超时，也绝不允许直接输出全英文标题与正文
+    fallback_title = translate_title_fallback(ev["title"], api_key)
     return {
         "is_relevant": True,
-        "category": "最新动态",
-        "impact_score": 7,
-        "title_cn": ev["title"],
+        "category": "事项预告" if re.search(r"(?i)financial results|conference call|webcast", ev["title"]) else "最新动态",
+        "impact_score": 5 if re.search(r"(?i)financial results|conference call|webcast", ev["title"]) else 6,
+        "title_cn": fallback_title,
         "body_cn": ev["body_en"][:3000],
         "_model": "fallback",
     }
@@ -1322,7 +1346,7 @@ def gemini_industry_digest(ev, api_key):
     return True, media_name, topic_cn, digest_text
 
 
-def process_single_event(ev, config, access_token, vault_knowledge, processed_ids):
+def process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles=None):
     """
     统一事件处理器：
     - 区分三种推送标题前缀：
@@ -1407,66 +1431,100 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
     pub_time_str = format_pub_time(ev.get("published_at"))
     time_label = ev.get("time_label", "原始发布时间")
 
-    # 第一步推送：事实全译（【官方】{Ticker} | 标题 或 【第三方】{Ticker} | 标题）
-    fact_push_title = f"{title_prefix}{stock['ticker']} | {title_cn}"
-    fact_html = f"""
-    <div style="font-family:sans-serif;line-height:1.68;font-size:14px;">
-      <p style="margin:0 0 6px 0;font-size:13px;">
-        <b>{stock['ticker']}</b> ({stock['company']}) ｜ {category} ｜ <b>{score}/10</b><br/>
-        🕒 {html.escape(time_label)}：{html.escape(pub_time_str)}<br/>
-        📡 信源：{html.escape(ev['source'])}
-      </p>
-      <p style="margin:8px 0;line-height:1.5;">
-        <b>标题：</b>{html.escape(ev['title'])}<br/>
-        <b>{html.escape(title_cn)}</b>
-      </p>
-      <hr style="border:none;border-top:1px solid #555;margin:8px 0;"/>
-      <div style="margin:8px 0;font-size:14px;white-space:pre-wrap;">{format_body_for_wechat_html(body_cn)}</div>
-      <hr style="border:none;border-top:1px solid #555;margin:8px 0;"/>
-      <p style="margin:4px 0;font-size:13px;">
-        <a href="{ev['url']}">🔗 查看英文原稿</a>
-      </p>
-    </div>
-    """
-    send_pushplus(push_token, fact_push_title, fact_html)
-    print(f"[INFO] Sent Step 1 Facts Push: {fact_push_title} (score={score})")
+    # 标题防重复：检查是否已在 24 小时内推送过相同事件
+    norm_title = re.sub(r"[^a-z0-9]+", "", ev["title"].lower())
+    if processed_titles and norm_title in processed_titles:
+        print(f"[INFO] Skipped duplicate story by title for {stock['ticker']}: {ev['title']}")
+        processed_ids.add(ev["id"])
+        return
 
-    deep_text = "未达深度解读阈值或为短快讯（仅推送事实全貌，已跳过深度解读）"
-    # 第二步深度解读准入条件：
-    # 1. 评分达到阈值 (score >= threshold)
-    # 2. 具备实质长文正文 (has_substantive_body 且字数充实 >= 120 字符)
+    # 智能识别纯日程/电话会预告（避免对没有业绩数据的预告强行深度分析）
+    is_schedule_notice = bool(
+        re.search(r"(?i)to report .* financial results|conference call on|webcast on|announces date for|financial results on", ev["title"])
+    )
+    if is_schedule_notice:
+        category = "事项预告"
+        score = min(score, 6)
+
+    # 准备深度解读（条件：高分、有实质长文、且非纯日程预告）
+    deep_text = ""
+    deep_model_label = ""
+    vault_badge = ""
     can_deep_analyze = (
         score >= threshold
         and ev.get("has_substantive_body", True)
         and len(body_cn.strip()) >= 120
+        and "仅含标题" not in body_cn
+        and not is_schedule_notice
     )
 
     if can_deep_analyze:
-        time.sleep(2)
+        time.sleep(1.5)
         stock_vault_notes = list(vault_knowledge.get(stock["ticker"], []))
         if stock["ticker"] == "MANE" and "ABSI" in vault_knowledge:
             stock_vault_notes.extend(vault_knowledge["ABSI"])
-        deep_text, deep_model = gemini_deep_analysis(
+        res_deep, used_m = gemini_deep_analysis(
             ev, facts, api_key, vault_notes=stock_vault_notes
         )
-        vault_badge = " + 投研库内外口径比对" if stock_vault_notes else ""
-        deep_title = f"{deep_prefix}{stock['ticker']} | {title_cn}"
-        deep_html = f"""
-        <div style="font-family:sans-serif;line-height:1.68;font-size:14px;">
-          <p style="margin:0 0 8px 0;font-size:13px;">
-            <b>关联标题：</b>{html.escape(title_cn)}<br/>
-            🕒 <b>{html.escape(time_label)}：</b>{html.escape(pub_time_str)}<br/>
-            📡 <b>信源：</b>{html.escape(ev['source'])}<br/>
-            🧠 <b>引擎：</b>{deep_model} + ClinicalTrials.gov{vault_badge}
-          </p>
-          <hr style="border:none;border-top:1px solid #555;margin:8px 0;"/>
-          <div style="white-space:pre-wrap;font-size:14px;">{format_body_for_wechat_html(deep_text)}</div>
-          <hr style="border:none;border-top:1px solid #555;margin:8px 0;"/>
-          <p style="font-size:13px;"><a href="{ev['url']}">🔗 查看英文原稿</a> ｜ <a href="https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit">📊 打开云端历史归档表 (Logs)</a></p>
+        if res_deep and "深度解读暂不可用" not in res_deep and len(res_deep.strip()) >= 50:
+            deep_text = res_deep.strip()
+            deep_model_label = used_m
+            vault_badge = " + 投研库内外口径比对" if stock_vault_notes else ""
+
+    # 构建统一单条推送（杜绝连发两条微信骚扰，绝不发送第二条“深度解读暂不可用”的空壳消息！）
+    has_deep = bool(deep_text)
+    badge = f"【{'官方' if is_official else '第三方'}{'·深度' if has_deep else ''}】"
+    push_title = f"{badge}{stock['ticker']} | {title_cn}"
+
+    deep_card_html = ""
+    if has_deep:
+        deep_card_html = f"""
+        <div style="background:#fef7e0;border-left:4px solid #fbbc04;padding:12px 14px;margin:12px 0;border-radius:4px;">
+          <div style="font-weight:bold;color:#b06000;font-size:13px;margin-bottom:6px;">
+            💡 Gemini 深度投研解读 ({deep_model_label} + ClinicalTrials{vault_badge})
+          </div>
+          <div style="font-size:13.5px;line-height:1.65;color:#202124;">
+            {format_body_for_wechat_html(deep_text)}
+          </div>
         </div>
         """
-        send_pushplus(push_token, deep_title, deep_html)
-        print(f"[INFO] Sent Step 2 Deep Analysis: {deep_title} using {deep_model}")
+
+    notice_tip = ""
+    if is_schedule_notice:
+        notice_tip = """
+        <div style="background:#e8f0fe;border-left:4px solid #1a73e8;padding:8px 12px;margin:10px 0;border-radius:4px;font-size:13px;color:#174ea6;">
+          📌 <b>【事项预告提示】</b>：本通告为公司例行公布的财报/电话会日程预告，尚未披露具体经营业绩与财务数据。完整财务报告将在预告时间正式公布。
+        </div>
+        """
+
+    unified_html = f"""
+    <div style="font-family:sans-serif;line-height:1.68;font-size:14px;color:#202124;">
+      <p style="margin:0 0 6px 0;font-size:13px;color:#555;">
+        <b>{stock['ticker']}</b> ({stock['company']}) ｜ {category} ｜ <b>影响评分：{score}/10</b><br/>
+        🕒 {html.escape(time_label)}：{html.escape(pub_time_str)}<br/>
+        📡 信源：{html.escape(ev['source'])}
+      </p>
+      <div style="margin:8px 0;line-height:1.45;">
+        <span style="color:#666;font-size:12px;">【原标题】</span> <span style="font-size:12.5px;color:#444;">{html.escape(ev['title'])}</span><br/>
+        <span style="color:#1a73e8;font-weight:bold;font-size:15px;">{html.escape(title_cn)}</span>
+      </div>
+      {notice_tip}
+      {deep_card_html}
+      <hr style="border:none;border-top:1px solid #ddd;margin:10px 0;"/>
+      <div style="margin:8px 0;font-size:14px;line-height:1.7;">
+        <div style="font-weight:bold;color:#188038;margin-bottom:6px;font-size:13px;">📄 事实全文直译与临床数据：</div>
+        {format_body_for_wechat_html(body_cn)}
+      </div>
+      <hr style="border:none;border-top:1px solid #ddd;margin:10px 0;"/>
+      <p style="margin:4px 0;font-size:12.5px;color:#666;">
+        <a href="{ev['url']}">🔗 查看英文原稿</a> ｜ <a href="https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit">📊 打开云端历史归档 (Logs)</a>
+      </p>
+    </div>
+    """
+
+    send_pushplus(push_token, push_title, unified_html)
+    print(f"[INFO] Sent Unified Single Push: {push_title} (score={score}, has_deep={has_deep})")
+    log_deep_text = deep_text if deep_text else "未达深度解读阈值或为短快讯（已整合推送事实全貌）"
 
     bj_time = (
         datetime.datetime.now(datetime.timezone.utc)
@@ -1481,7 +1539,7 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
             category,
             score,
             f"【{time_label}】{pub_time_str}\n【原始信源】{ev['source']}\n【英文原标题】{ev['title']}\n【中文翻译标题】{title_cn}\n【中文翻译正文】{body_cn}",
-            deep_text,
+            log_deep_text,
             f"{ev['title']} ({ev['url']})",
             ev["id"],
         ],
@@ -1491,7 +1549,7 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
 
 def main(duration_minutes=0):
     access_token = get_google_access_token()
-    config, portfolio, processed_ids = load_sheet_state(access_token)
+    config, portfolio, processed_ids, processed_titles = load_sheet_state(access_token)
 
     print(f"[INFO] Loaded {len(portfolio)} active targets from Google Sheet: {[s['ticker'] for s in portfolio]}")
 
@@ -1524,7 +1582,7 @@ def main(duration_minutes=0):
             gmail_ev = fetch_gmail_imap_events(config, portfolio, processed_ids, max_age_hours=24)
             for ev in gmail_ev:
                 if ev["id"] not in processed_ids:
-                    process_single_event(ev, config, access_token, vault_knowledge, processed_ids)
+                    process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
 
             # 2. 定时 SEC EDGAR & Yahoo Finance RSS 检查 (每 60 秒轮询一次)
             if now_t - last_rss_sec_check >= 60:
@@ -1534,13 +1592,13 @@ def main(duration_minutes=0):
                     sec_ev = fetch_sec_edgar_events(stock, cik, max_age_hours=24)
                     for ev in sec_ev:
                         if ev["id"] not in processed_ids:
-                            process_single_event(ev, config, access_token, vault_knowledge, processed_ids)
+                            process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
 
                 for stock in portfolio:
                     yf_ev = fetch_yahoo_direct_news(stock, max_age_hours=24)
                     for ev in yf_ev:
                         if ev["id"] not in processed_ids:
-                            process_single_event(ev, config, access_token, vault_knowledge, processed_ids)
+                            process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
 
             time.sleep(10)
         print(f"[INFO] Continuous Monitor Loop completed cleanly after {duration_minutes} minutes.")
@@ -1571,7 +1629,7 @@ def main(duration_minutes=0):
 
     for ev in all_events[:5]:
         if ev["id"] not in processed_ids:
-            process_single_event(ev, config, access_token, vault_knowledge, processed_ids)
+            process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
 
 
 if __name__ == "__main__":
