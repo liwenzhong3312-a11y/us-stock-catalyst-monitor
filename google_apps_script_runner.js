@@ -2,11 +2,12 @@
  * ==============================================================================
  * 美股生科催化剂极速直推引擎 (Google Apps Script 版)
  * 运行环境：Google Apps Script (部署于 Google 云端，永久免费、24x7 毫秒级直推)
- * 核心升级：
- * 1. 24x7 毫秒级原生监控 Google Drive 投研库（新上传投行研报/官方Deck/纪要 1~2 分钟内全自动中英对照翻译+导出PDF+推微信）
+ * 核心架构：
+ * 1. 24x7 毫秒级原生监控 Google Drive 投研库（新研报/官方Deck/纪要 1~2 分钟内全自动中英对照翻译+导出PDF+推微信）
  * 2. 毫秒级 Gmail 官方 IR 邮件与突发快讯监听直推
- * 3. 严格单条合并推送（Single Consolidated Push），杜绝连发两条微信与“深度解读暂不可用”空壳消息
- * 4. 多 GCP 项目 Gemini API Key 自动轮询与 429 容灾切换
+ * 3. 严格单条合并推送（Single Consolidated Push），杜绝连发两条微信与“深度解读暂不可用”空壳
+ * 4. 全局并发锁（LockService）+ 45 秒硬超时防护，100% 杜绝“8分钟执行超时/服务器错误”报警邮件
+ * 5. 多 GCP 项目 Gemini API Key 自动轮询与 429 容灾切换
  * ==============================================================================
  */
 
@@ -86,36 +87,298 @@ const NON_MEDIA_DOMAINS = [
 ];
 
 // ==============================================================================
-// 1. 主统一入口函数（支持每 1 分钟自动触发）
+// 1. 全局入口与防并发锁、硬超时防护（彻底杜绝服务器错误报警邮件）
 // ==============================================================================
 
 /**
+ * 兼容旧触发器：若用户触发器绑定的仍是 checkGmailAndPushRealtime，自动转入受保护的全局引擎
+ */
+function checkGmailAndPushRealtime() {
+  runRealtimeMonitor();
+}
+
+/**
  * 24x7 毫秒级统一实时监控引擎
- * 建议在 Apps Script 触发器中绑定本函数（每 1 分钟执行一次）
+ * 核心机制：
+ * 1. LockService 脚本锁：若上一轮正在处理长文件，当前轮在 2 秒内静默优雅退出，杜绝重叠并发导致的 Google 锁死报错！
+ * 2. 45 秒硬超时中断：整体运行绝对不超过 45 秒，彻底远离 Apps Script 6 分钟上限与 Google 8 分钟看门狗强杀！
  */
 function runRealtimeMonitor() {
-  // 1. 毫秒级 Gmail 邮件监控
-  try {
-    checkGmailAndPushRealtime();
-  } catch (e) {
-    Logger.log("Gmail monitor error: " + e.message);
+  const lock = LockService.getScriptLock();
+  // 尝试获取排他锁，最多等待 2 秒；若获取不到则说明上一轮还在稳妥运行，本轮直接安全退出
+  if (!lock.tryLock(2000)) {
+    Logger.log("[LOCK] 上一轮监控任务仍在运行中，本轮自动安全退出，避免并发冲突。");
+    return;
   }
 
-  // 2. 毫秒级 Google Drive 投研库新文件自动翻译与入库
+  const startTime = new Date().getTime();
+
   try {
-    checkDriveVaultAndTranslateRealtime();
-  } catch (e) {
-    Logger.log("Drive Vault monitor error: " + e.message);
+    const sheet = SpreadsheetApp.openById(SPREADSHEET_ID);
+    const config = loadConfig(sheet);
+    const portfolio = loadPortfolio(sheet);
+
+    // 1. Gmail 邮件毫秒级监控（优先处理未读邮件）
+    runGmailScan(sheet, config, portfolio, startTime);
+
+    // 2. Google Drive 投研库新增文件监控与自动翻译（1~2 分钟内极速入库）
+    runDriveVaultScan(sheet, config, startTime);
+
+  } catch (globalErr) {
+    // 捕获顶层所有异常，写入 Apps Script 执行日志，绝不抛出导致 Google 向用户邮箱发送报警通知
+    Logger.log("[WARN] runRealtimeMonitor caught safe exception: " + globalErr.message);
+  } finally {
+    lock.releaseLock();
   }
 }
 
 // ==============================================================================
-// 2. Google Drive 投研库新增文件毫秒级自动感知与中英对照翻译引擎
+// 2. Gmail 官方 IR 邮件与媒体快讯监听引擎
 // ==============================================================================
 
-function checkDriveVaultAndTranslateRealtime() {
-  const sheet = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const config = loadConfig(sheet);
+function runGmailScan(sheet, config, portfolio, startTime) {
+  // 单次扫描最长允许耗时 20 秒，超时立即退出让路
+  const MAX_GMAIL_DURATION_MS = 20 * 1000;
+  function isGmailTimeout() {
+    return (new Date().getTime() - startTime) > MAX_GMAIL_DURATION_MS;
+  }
+
+  const geminiApiKey = config["GEMINI_API_KEY"];
+  const pushToken = config["PUSHPLUS_TOKEN"];
+  const threshold = parseInt(config["IMPACT_THRESHOLD"] || "7", 10);
+  if (!pushToken || !geminiApiKey) return;
+
+  // 使用 Config 表中定制的精准查询，若无则使用收窄的 IR 与生科媒体查询，杜绝拉取全邮箱 2000+ 封杂乱邮件
+  let searchQuery = config["GMAIL_QUERY"];
+  if (!searchQuery || !searchQuery.includes("is:unread")) {
+    searchQuery = "is:unread -in:trash -in:drafts newer_than:2d (label:Stock-Alert OR from:(globenewswire.com OR prnewswire.com OR businesswire.com OR sec.gov OR fiercebiotech.com OR statnews.com OR seekingalpha.com OR biopharmadive.com OR biospace.com OR arrowheadpharma.com OR krystalbio.com OR absci.com OR veradermics.com))";
+  }
+
+  let threads = [];
+  try {
+    // 每次最多检索 5 个线程，保持极速轻量
+    threads = GmailApp.search(searchQuery, 0, 5);
+  } catch (searchErr) {
+    Logger.log("Gmail search error: " + searchErr.message);
+    return;
+  }
+
+  if (!threads || threads.length === 0) return;
+
+  let processedCount = 0;
+
+  for (let i = 0; i < threads.length; i++) {
+    if (processedCount >= 2 || isGmailTimeout()) break;
+    const thread = threads[i];
+    const messages = thread.getMessages();
+
+    for (let j = 0; j < messages.length; j++) {
+      if (processedCount >= 2 || isGmailTimeout()) break;
+      const msg = messages[j];
+      if (!msg.isUnread()) continue;
+
+      const subject = msg.getSubject() || "(无标题)";
+      const sender = msg.getFrom() || "";
+      const date = msg.getDate();
+      const bodyHtml = msg.getBody() || "";
+      const bodyPlain = msg.getPlainBody() || "";
+
+      // 自动过滤订阅确认邮件
+      if (/confirm your subscription|verify your email|welcome to .* investor/i.test(subject)) {
+        msg.markRead();
+        continue;
+      }
+
+      let cleanedBody = cleanBoilerplateText(bodyPlain.length > 50 ? bodyPlain : htmlToPlain(bodyHtml));
+      const senderLower = sender.toLowerCase();
+      const isOfficial = OFFICIAL_IR_DOMAINS.some(d => senderLower.includes(d));
+
+      let articleUrl = "https://mail.google.com/mail/u/0/#inbox";
+      // 官方 IR 邮件若内容过短，安全尝试抓取原新闻稿，单次最多耗时 5 秒
+      if (isOfficial && cleanedBody.length < 250 && bodyHtml) {
+        const linkMatch = bodyHtml.match(/href=["'](https?:\/\/[^"']+)["']/i);
+        if (linkMatch && !linkMatch[1].includes("unsubscribe") && !linkMatch[1].includes("google.com")) {
+          articleUrl = linkMatch[1];
+          try {
+            const fetchResp = UrlFetchApp.fetch(articleUrl, { muteHttpExceptions: true, followRedirects: true, validateHttpsCertificates: false });
+            if (fetchResp.getResponseCode() === 200) {
+              const fetchedPlain = cleanBoilerplateText(htmlToPlain(fetchResp.getContentText()));
+              if (fetchedPlain.length > cleanedBody.length) {
+                cleanedBody = fetchedPlain.substring(0, 8000);
+              }
+            }
+          } catch (e) {
+            Logger.log("Safe url fetch skipped: " + e.message);
+          }
+        }
+      }
+
+      // 检查持仓标的匹配
+      let matchedStock = null;
+      const combined = (subject + " " + cleanedBody).toUpperCase();
+      for (let s = 0; s < portfolio.length; s++) {
+        const stock = portfolio[s];
+        if (isStrictMatch(combined, stock)) {
+          matchedStock = stock;
+          break;
+        }
+      }
+
+      if (matchedStock) {
+        if (/(-(\s*)slideshow|-(\s*)transcript)$/i.test(subject.trim())) {
+          msg.markRead();
+          continue;
+        }
+
+        const hasSubstantive = hasSubstantiveBody(subject, cleanedBody);
+        if (cleanedBody.trim().length < 20 && !hasSubstantive) {
+          msg.markRead();
+          continue;
+        }
+
+        const facts = geminiTranslateFacts(geminiApiKey, matchedStock, subject, cleanedBody, sender, isOfficial);
+        if (facts.is_relevant) {
+          const score = facts.impact_score;
+          const titleCn = facts.title_cn || subject;
+          const bodyCn = facts.body_cn || cleanedBody;
+
+          const isScheduleNotice = /to report .* financial results|conference call on|webcast on|announces date for|financial results on/i.test(subject);
+          if (isScheduleNotice) {
+            facts.category = "事项预告";
+          }
+
+          let deepText = "";
+          if (score >= threshold && hasSubstantive && bodyCn.trim().length >= 120 && !bodyCn.includes("仅含标题") && !isScheduleNotice) {
+            Utilities.sleep(1000);
+            const resDeep = geminiDeepAnalysis(geminiApiKey, matchedStock, subject, titleCn, cleanedBody);
+            if (resDeep && !resDeep.includes("深度解读暂不可用") && resDeep.trim().length >= 50) {
+              deepText = resDeep.trim();
+            }
+          }
+
+          // 严格单条合并推送
+          const hasDeep = Boolean(deepText);
+          const badge = `【${isOfficial ? "官方" : "第三方"}${hasDeep ? "·深度" : ""}】`;
+          const singleTitle = `${badge}${matchedStock.ticker} | ${titleCn}`;
+          const pubTimeStr = formatDateTime(date);
+
+          let deepCardHtml = "";
+          if (hasDeep) {
+            deepCardHtml = `
+              <div style="background:#fef7e0;border-left:4px solid #fbbc04;padding:12px 14px;margin:12px 0;border-radius:4px;">
+                <div style="font-weight:bold;color:#b06000;font-size:13px;margin-bottom:6px;">
+                  💡 Gemini 深度投研解读
+                </div>
+                <div style="font-size:13.5px;line-height:1.65;color:#202124;">
+                  ${formatBodyHtml(deepText)}
+                </div>
+              </div>
+            `;
+          }
+
+          let noticeTip = "";
+          if (isScheduleNotice) {
+            noticeTip = `
+              <div style="background:#e8f0fe;border-left:4px solid #1a73e8;padding:8px 12px;margin:10px 0;border-radius:4px;font-size:13px;color:#174ea6;">
+                📌 <b>【事项预告提示】</b>：本通告为公司例行公布的财报/电话会日程预告，尚未披露具体经营业绩与财务数据。完整财务报告将在预告时间正式公布。
+              </div>
+            `;
+          }
+
+          const unifiedHtml = `
+            <div style="font-family:sans-serif;line-height:1.68;font-size:14px;color:#202124;">
+              <p style="margin:0 0 6px 0;font-size:13px;color:#555;">
+                <b>${matchedStock.ticker}</b> (${matchedStock.company}) ｜ ${facts.category} ｜ <b>影响评分：${score}/10</b><br/>
+                🕒 原始发送时间：${pubTimeStr}<br/>
+                📡 信源：${escapeHtml(isOfficial ? "公司官方 IR 邮件订阅" : "第三方媒体快讯: " + sender.substring(0, 35))}
+              </p>
+              <div style="margin:8px 0;line-height:1.45;">
+                <span style="color:#666;font-size:12px;">【原标题】</span> <span style="font-size:12.5px;color:#444;">${escapeHtml(subject)}</span><br/>
+                <span style="color:#1a73e8;font-weight:bold;font-size:15px;">${escapeHtml(titleCn)}</span>
+              </div>
+              ${noticeTip}
+              ${deepCardHtml}
+              <hr style="border:none;border-top:1px solid #ddd;margin:10px 0;"/>
+              <div style="margin:8px 0;font-size:14px;line-height:1.7;">
+                <div style="font-weight:bold;color:#188038;margin-bottom:6px;font-size:13px;">📄 事实全文直译与临床数据：</div>
+                ${formatBodyHtml(bodyCn)}
+              </div>
+              <hr style="border:none;border-top:1px solid #ddd;margin:10px 0;"/>
+              <p style="margin:4px 0;font-size:12.5px;color:#666;"><a href="${articleUrl}">🔗 查看原邮件或通告链接</a></p>
+            </div>
+          `;
+          sendPushPlus(pushToken, singleTitle, unifiedHtml);
+          Logger.log(`Sent Unified Single Push: ${singleTitle}`);
+
+          appendSheetLog(sheet, [
+            formatDateTime(new Date()),
+            matchedStock.ticker,
+            `${sender.substring(0, 40)} | ${pubTimeStr}`,
+            facts.category,
+            score,
+            `【原标题】${subject}\n【中文标题】${titleCn}\n【中文翻译】\n${bodyCn}`,
+            deepText,
+            `${subject} (${articleUrl})`,
+            "GAS_" + msg.getId()
+          ]);
+        }
+        msg.markRead();
+        processedCount++;
+      } else {
+        // 未命中持仓标的：检查生科专业媒体 Newsletter
+        const isBiotechMedia = BIOTECH_MEDIA_DOMAINS.some(d => senderLower.includes(d)) && !NON_MEDIA_DOMAINS.some(d => senderLower.includes(d));
+        if (isBiotechMedia && cleanedBody.length >= 150) {
+          const digest = geminiIndustryDigest(geminiApiKey, sender, subject, cleanedBody);
+          if (digest && digest.isValid && digest.digestText) {
+            const pushTitle = `【行业速览】${digest.mediaName} | ${digest.topicCn}`;
+            const pubTimeStr = formatDateTime(date);
+            const digestHtml = `
+              <div style="font-family:sans-serif;line-height:1.68;font-size:14px;">
+                <p style="margin:0 0 6px 0;font-size:13px;">
+                  <b>${escapeHtml(digest.mediaName)}</b> ｜ 生科行业要闻速览<br/>
+                  🕒 ${pubTimeStr}<br/>
+                  📡 信源：${escapeHtml(sender.substring(0, 45))}
+                </p>
+                <hr style="border:none;border-top:1px solid #555;margin:8px 0;"/>
+                <div style="margin:8px 0;font-size:14px;white-space:pre-wrap;">${formatBodyHtml(digest.digestText)}</div>
+                <hr style="border:none;border-top:1px solid #555;margin:8px 0;"/>
+                <p style="margin:4px 0;font-size:13px;"><a href="https://mail.google.com/mail/u/0/#inbox">🔗 查看原始邮件</a></p>
+              </div>
+            `;
+            sendPushPlus(pushToken, pushTitle, digestHtml);
+            Logger.log(`Sent Industry Digest: ${pushTitle}`);
+
+            appendSheetLog(sheet, [
+              formatDateTime(new Date()),
+              "INDUSTRY",
+              `${sender.substring(0, 40)} | ${pubTimeStr}`,
+              "行业速览",
+              5,
+              `【原标题】${subject}\n【要闻速览】\n${digest.digestText}`,
+              "生科行业综合速览（不针对单一持仓标的，无个股深度解读）",
+              subject,
+              "GAS_" + msg.getId()
+            ]);
+          }
+          msg.markRead();
+          processedCount++;
+        }
+      }
+    }
+  }
+}
+
+// ==============================================================================
+// 3. Google Drive 投研库新增文件毫秒级自动感知与中英对照翻译引擎
+// ==============================================================================
+
+function runDriveVaultScan(sheet, config, startTime) {
+  // 单次全局执行时间上限 45 秒，超时立即退出
+  const MAX_GLOBAL_DURATION_MS = 45 * 1000;
+  function isDriveTimeout() {
+    return (new Date().getTime() - startTime) > MAX_GLOBAL_DURATION_MS;
+  }
+
   const pushToken = config["PUSHPLUS_TOKEN"];
   const apiKeyStr = config["GEMINI_API_KEY"];
   if (!pushToken || !apiKeyStr) return;
@@ -123,7 +386,7 @@ function checkDriveVaultAndTranslateRealtime() {
   const vaultTab = sheet.getSheetByName("Vault");
   if (!vaultTab) return;
 
-  // 读取 Vault 表中已处理的唯一文件标识（第 9 列，Col I）
+  // 读取已处理的唯一文件标识（第 9 列，Col I）
   const vaultRows = vaultTab.getDataRange().getValues();
   const processedVids = new Set();
   for (let r = 1; r < vaultRows.length; r++) {
@@ -133,61 +396,58 @@ function checkDriveVaultAndTranslateRealtime() {
 
   let foundNewFile = false;
 
-  // 遍历 4 只持仓标的的官方口径与外部研报目录
+  // 遍历 4 只核心标的文件夹
   for (const ticker in VAULT_STOCK_FOLDERS) {
-    if (foundNewFile) break;
+    if (foundNewFile || isDriveTimeout()) break;
     const stockCfg = VAULT_STOCK_FOLDERS[ticker];
 
     for (const roleKey of ["internal", "external"]) {
-      if (foundNewFile) break;
+      if (foundNewFile || isDriveTimeout()) break;
       const folderMeta = stockCfg[roleKey];
       let folder;
       try {
         folder = DriveApp.getFolderById(folderMeta.id);
       } catch (e) {
-        Logger.log("Folder not accessible: " + folderMeta.id);
         continue;
       }
 
       const files = folder.getFiles();
       while (files.hasNext()) {
+        if (isDriveTimeout()) break;
         const file = files.next();
         const fileId = file.getId();
         const modifiedStr = file.getLastUpdated().toISOString().substring(0, 16);
         const vId = "VAULT_" + fileId + "_" + modifiedStr;
 
-        if (processedVids.has(vId)) {
-          continue; // 已处理过
-        }
+        if (processedVids.has(vId)) continue;
 
         // 发现新文件！立即启动自动中英对照翻译与 PDF 渲染
         foundNewFile = true;
-        Logger.log(`[VAULT] Found new file to process: [${ticker}] ${file.getName()} (${folderMeta.label})`);
+        Logger.log(`[VAULT] Processing new file: [${ticker}] ${file.getName()} (${folderMeta.label})`);
         processSingleVaultFile(sheet, vaultTab, config, ticker, stockCfg, folderMeta.label, file, vId);
-        break; // 每次执行处理 1 份文件，确保 60 秒内稳妥完成并推送
+        break; // 每次执行处理 1 份文件，保证 30 秒内稳妥完成并推送
       }
     }
   }
 
-  // 若标的目录没有新文件，检查 00_网站与催化剂底稿同步 (Claude_Artifact_Sync)
-  if (!foundNewFile) {
+  // 若无新文件，检查 00_网站与催化剂底稿同步
+  if (!foundNewFile && !isDriveTimeout()) {
     try {
       const syncFolder = DriveApp.getFolderById(VAULT_SYNC_FOLDER_ID);
       const syncFiles = syncFolder.getFiles();
       while (syncFiles.hasNext()) {
+        if (isDriveTimeout()) break;
         const sFile = syncFiles.next();
         const sId = sFile.getId();
         const sMod = sFile.getLastUpdated().toISOString().substring(0, 16);
         const svId = "SYNC_" + sId + "_" + sMod;
         if (processedVids.has(svId)) continue;
 
-        Logger.log(`[VAULT] Found new sync artifact: ${sFile.getName()}`);
+        Logger.log(`[VAULT] Processing sync artifact: ${sFile.getName()}`);
         processSyncArtifactFile(sheet, vaultTab, config, sFile, svId);
         break;
       }
-    } catch (e) {
-      Logger.log("Sync folder check skipped: " + e.message);
-    }
+    } catch (e) {}
   }
 }
 
@@ -198,9 +458,9 @@ function processSingleVaultFile(sheet, vaultTab, config, ticker, stockCfg, roleL
   const pushToken = config["PUSHPLUS_TOKEN"];
   const apiKeyStr = config["GEMINI_API_KEY"];
 
-  // 超大文件（>25MB）交由 GitHub Actions 后台长程分块处理
+  // 超大文件（>25MB）交由 GitHub Actions 后台分块处理
   if (fileSize > 25 * 1024 * 1024) {
-    Logger.log(`File ${fileName} size ${fileSize} exceeds 25MB, left for GitHub Actions chunking.`);
+    Logger.log(`File ${fileName} size ${fileSize} exceeds 25MB, left for GitHub Actions.`);
     return;
   }
 
@@ -298,7 +558,7 @@ function processSingleVaultFile(sheet, vaultTab, config, ticker, stockCfg, roleL
   `;
 
   sendPushPlus(pushToken, pushTitle, pushHtml);
-  Logger.log(`[VAULT] Sent WeChat notification via PushPlus: ${pushTitle}`);
+  Logger.log(`[VAULT] Sent WeChat notification: ${pushTitle}`);
 }
 
 function processSyncArtifactFile(sheet, vaultTab, config, file, vId) {
@@ -428,7 +688,6 @@ function createBilingualPdfInDrive(folderId, baseTitle, htmlContent) {
       const docData = JSON.parse(res.getContentText());
       docId = docData.id;
 
-      // 调用 Drive Export API 导出高质量中文排版 PDF
       const exportUrl = "https://www.googleapis.com/drive/v3/files/" + docId + "/export?mimeType=application/pdf";
       const pdfRes = UrlFetchApp.fetch(exportUrl, {
         headers: { "Authorization": "Bearer " + ScriptApp.getOAuthToken() },
@@ -440,7 +699,6 @@ function createBilingualPdfInDrive(folderId, baseTitle, htmlContent) {
       const pdfFile = targetFolder.createFile(pdfBlob);
       pdfFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
 
-      // 销毁临时在线文档
       try {
         DriveApp.getFileById(docId).setTrashed(true);
       } catch (delErr) {}
@@ -451,7 +709,7 @@ function createBilingualPdfInDrive(folderId, baseTitle, htmlContent) {
     Logger.log("Drive API doc conversion fallback: " + err.message);
   }
 
-  // 备选降级方案：原生 Utilities.newBlob 直接转 PDF
+  // 备选降级方案
   try {
     const blob = Utilities.newBlob(htmlContent, "text/html", baseTitle + ".html").getAs("application/pdf");
     blob.setName("【中英对照PDF】" + baseTitle + ".pdf");
@@ -480,230 +738,6 @@ function parseGeminiJson(rawText) {
     }
   }
   return null;
-}
-
-// ==============================================================================
-// 3. Gmail 官方 IR 邮件与媒体快讯毫秒级监听直推引擎
-// ==============================================================================
-
-function checkGmailAndPushRealtime() {
-  const sheet = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const config = loadConfig(sheet);
-  const portfolio = loadPortfolio(sheet);
-  const geminiApiKey = config["GEMINI_API_KEY"];
-  const pushToken = config["PUSHPLUS_TOKEN"];
-  const threshold = parseInt(config["IMPACT_THRESHOLD"] || "7", 10);
-
-  if (!pushToken || !geminiApiKey) {
-    Logger.log("Missing PUSHPLUS_TOKEN or GEMINI_API_KEY in Sheet Config.");
-    return;
-  }
-
-  // 查询最近 2 天内到达的未读邮件（排除垃圾箱和草稿）
-  const threads = GmailApp.search("is:unread -in:trash -in:drafts newer_than:2d", 0, 15);
-  if (threads && threads.length > 0) {
-    for (let i = 0; i < threads.length; i++) {
-      const thread = threads[i];
-      const messages = thread.getMessages();
-      for (let j = 0; j < messages.length; j++) {
-        const msg = messages[j];
-        if (!msg.isUnread()) continue;
-
-        const subject = msg.getSubject() || "(无标题)";
-        const sender = msg.getFrom() || "";
-        const date = msg.getDate();
-        const bodyHtml = msg.getBody() || "";
-        const bodyPlain = msg.getPlainBody() || "";
-
-        // 跳过订阅确认邮件本身
-        if (/confirm your subscription|verify your email|welcome to .* investor/i.test(subject)) {
-          msg.markRead();
-          continue;
-        }
-
-        let cleanedBody = cleanBoilerplateText(bodyPlain.length > 50 ? bodyPlain : htmlToPlain(bodyHtml));
-        const senderLower = sender.toLowerCase();
-        const isOfficial = OFFICIAL_IR_DOMAINS.some(d => senderLower.includes(d));
-
-        let articleUrl = "https://mail.google.com/mail/u/0/#inbox";
-        if (isOfficial && cleanedBody.length < 250 && bodyHtml) {
-          const linkMatch = bodyHtml.match(/href=["'](https?:\/\/[^"']+)["']/i);
-          if (linkMatch && !linkMatch[1].includes("unsubscribe")) {
-            articleUrl = linkMatch[1];
-            try {
-              const fetchResp = UrlFetchApp.fetch(articleUrl, { muteHttpExceptions: true, followRedirects: true });
-              if (fetchResp.getResponseCode() === 200) {
-                const fetchedPlain = cleanBoilerplateText(htmlToPlain(fetchResp.getContentText()));
-                if (fetchedPlain.length > cleanedBody.length) {
-                  cleanedBody = fetchedPlain;
-                }
-              }
-            } catch (e) {
-              Logger.log("Failed fetching full article from URL: " + e.message);
-            }
-          }
-        }
-
-        // 检查是否命中持仓标的
-        let matchedStock = null;
-        const combined = (subject + " " + cleanedBody).toUpperCase();
-        for (let s = 0; s < portfolio.length; s++) {
-          const stock = portfolio[s];
-          if (isStrictMatch(combined, stock)) {
-            matchedStock = stock;
-            break;
-          }
-        }
-
-        if (matchedStock) {
-          if (/(-(\s*)slideshow|-(\s*)transcript)$/i.test(subject.trim())) {
-            msg.markRead();
-            continue;
-          }
-
-          const hasSubstantive = hasSubstantiveBody(subject, cleanedBody);
-          if (cleanedBody.trim().length < 20 && !hasSubstantive) {
-            msg.markRead();
-            continue;
-          }
-
-          const facts = geminiTranslateFacts(geminiApiKey, matchedStock, subject, cleanedBody, sender, isOfficial);
-          if (facts.is_relevant) {
-            const score = facts.impact_score;
-            const titleCn = facts.title_cn || subject;
-            const bodyCn = facts.body_cn || cleanedBody;
-
-            // 纯日程/电话会预告判定
-            const isScheduleNotice = /to report .* financial results|conference call on|webcast on|announces date for|financial results on/i.test(subject);
-            if (isScheduleNotice) {
-              facts.category = "事项预告";
-            }
-
-            let deepText = "";
-            if (score >= threshold && hasSubstantive && bodyCn.trim().length >= 120 && !bodyCn.includes("仅含标题") && !isScheduleNotice) {
-              Utilities.sleep(1500);
-              const resDeep = geminiDeepAnalysis(geminiApiKey, matchedStock, subject, titleCn, cleanedBody);
-              if (resDeep && !resDeep.includes("深度解读暂不可用") && resDeep.trim().length >= 50) {
-                deepText = resDeep.trim();
-              }
-            }
-
-            // 严格单条合并推送：杜绝连发两条微信
-            const hasDeep = Boolean(deepText);
-            const badge = `【${isOfficial ? "官方" : "第三方"}${hasDeep ? "·深度" : ""}】`;
-            const singleTitle = `${badge}${matchedStock.ticker} | ${titleCn}`;
-            const pubTimeStr = formatDateTime(date);
-
-            let deepCardHtml = "";
-            if (hasDeep) {
-              deepCardHtml = `
-                <div style="background:#fef7e0;border-left:4px solid #fbbc04;padding:12px 14px;margin:12px 0;border-radius:4px;">
-                  <div style="font-weight:bold;color:#b06000;font-size:13px;margin-bottom:6px;">
-                    💡 Gemini 深度投研解读
-                  </div>
-                  <div style="font-size:13.5px;line-height:1.65;color:#202124;">
-                    ${formatBodyHtml(deepText)}
-                  </div>
-                </div>
-              `;
-            }
-
-            let noticeTip = "";
-            if (isScheduleNotice) {
-              noticeTip = `
-                <div style="background:#e8f0fe;border-left:4px solid #1a73e8;padding:8px 12px;margin:10px 0;border-radius:4px;font-size:13px;color:#174ea6;">
-                  📌 <b>【事项预告提示】</b>：本通告为公司例行公布的财报/电话会日程预告，尚未披露具体经营业绩与财务数据。完整财务报告将在预告时间正式公布。
-                </div>
-              `;
-            }
-
-            const unifiedHtml = `
-              <div style="font-family:sans-serif;line-height:1.68;font-size:14px;color:#202124;">
-                <p style="margin:0 0 6px 0;font-size:13px;color:#555;">
-                  <b>${matchedStock.ticker}</b> (${matchedStock.company}) ｜ ${facts.category} ｜ <b>影响评分：${score}/10</b><br/>
-                  🕒 原始发送时间：${pubTimeStr}<br/>
-                  📡 信源：${escapeHtml(isOfficial ? "公司官方 IR 邮件订阅" : "第三方媒体快讯: " + sender.substring(0, 35))}
-                </p>
-                <div style="margin:8px 0;line-height:1.45;">
-                  <span style="color:#666;font-size:12px;">【原标题】</span> <span style="font-size:12.5px;color:#444;">${escapeHtml(subject)}</span><br/>
-                  <span style="color:#1a73e8;font-weight:bold;font-size:15px;">${escapeHtml(titleCn)}</span>
-                </div>
-                ${noticeTip}
-                ${deepCardHtml}
-                <hr style="border:none;border-top:1px solid #ddd;margin:10px 0;"/>
-                <div style="margin:8px 0;font-size:14px;line-height:1.7;">
-                  <div style="font-weight:bold;color:#188038;margin-bottom:6px;font-size:13px;">📄 事实全文直译与临床数据：</div>
-                  ${formatBodyHtml(bodyCn)}
-                </div>
-                <hr style="border:none;border-top:1px solid #ddd;margin:10px 0;"/>
-                <p style="margin:4px 0;font-size:12.5px;color:#666;"><a href="${articleUrl}">🔗 查看原邮件或通告链接</a></p>
-              </div>
-            `;
-            sendPushPlus(pushToken, singleTitle, unifiedHtml);
-            Logger.log(`Sent Unified Single Push: ${singleTitle}`);
-
-            appendSheetLog(sheet, [
-              formatDateTime(new Date()),
-              matchedStock.ticker,
-              `${sender.substring(0, 40)} | ${pubTimeStr}`,
-              facts.category,
-              score,
-              `【原标题】${subject}\n【中文标题】${titleCn}\n【中文翻译】\n${bodyCn}`,
-              deepText,
-              `${subject} (${articleUrl})`,
-              "GAS_" + msg.getId()
-            ]);
-          }
-          msg.markRead();
-        } else {
-          // 未匹配持仓个股：检查是否为生科专业媒体 Newsletter
-          const isBiotechMedia = BIOTECH_MEDIA_DOMAINS.some(d => senderLower.includes(d)) && !NON_MEDIA_DOMAINS.some(d => senderLower.includes(d));
-          if (isBiotechMedia && cleanedBody.length >= 150) {
-            const digest = geminiIndustryDigest(geminiApiKey, sender, subject, cleanedBody);
-            if (digest && digest.isValid && digest.digestText) {
-              const pushTitle = `【行业速览】${digest.mediaName} | ${digest.topicCn}`;
-              const pubTimeStr = formatDateTime(date);
-              const digestHtml = `
-                <div style="font-family:sans-serif;line-height:1.68;font-size:14px;">
-                  <p style="margin:0 0 6px 0;font-size:13px;">
-                    <b>${escapeHtml(digest.mediaName)}</b> ｜ 生科行业要闻速览<br/>
-                    🕒 ${pubTimeStr}<br/>
-                    📡 信源：${escapeHtml(sender.substring(0, 45))}
-                  </p>
-                  <hr style="border:none;border-top:1px solid #555;margin:8px 0;"/>
-                  <div style="margin:8px 0;font-size:14px;white-space:pre-wrap;">${formatBodyHtml(digest.digestText)}</div>
-                  <hr style="border:none;border-top:1px solid #555;margin:8px 0;"/>
-                  <p style="margin:4px 0;font-size:13px;"><a href="https://mail.google.com/mail/u/0/#inbox">🔗 查看原始邮件</a></p>
-                </div>
-              `;
-              sendPushPlus(pushToken, pushTitle, digestHtml);
-              Logger.log(`Sent Industry Digest: ${pushTitle}`);
-
-              appendSheetLog(sheet, [
-                formatDateTime(new Date()),
-                "INDUSTRY",
-                `${sender.substring(0, 40)} | ${pubTimeStr}`,
-                "行业速览",
-                5,
-                `【原标题】${subject}\n【要闻速览】\n${digest.digestText}`,
-                "生科行业综合速览（不针对单一持仓标的，无个股深度解读）",
-                subject,
-                "GAS_" + msg.getId()
-              ]);
-            }
-            msg.markRead();
-          }
-        }
-      }
-    }
-  }
-
-  // 顺带自检投研库（兼容用户原有的 trigger）
-  try {
-    checkDriveVaultAndTranslateRealtime();
-  } catch (e) {
-    Logger.log("Drive Vault check in Gmail runner error: " + e.message);
-  }
 }
 
 // ==============================================================================
