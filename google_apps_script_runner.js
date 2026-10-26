@@ -468,14 +468,29 @@ function processSingleVaultFile(sheet, vaultTab, config, ticker, stockCfg, roleL
   const base64Data = Utilities.base64Encode(blob.getBytes());
 
   const prompt = `你是一位拥有 20 年华尔街顶尖对冲基金背景的生物医药首席分析师（Wall Street Biotech Buy-Side Senior Analyst）。
-请针对以下关于上市公司 ${ticker} (${stockCfg.name}) 的投研文献（口径分类：${roleLabel}）：
+请深度解析并翻译上市公司 ${ticker} (${stockCfg.name}) 的投研文献（口径分类：${roleLabel}）：
 【原始文件名】：${fileName}
 
-请对文献进行高质量深度专业提炼与中英对照解析，并严格按以下 JSON Schema 格式输出纯 JSON（严禁返回 Markdown 代码块标记外的无关文字）：
+⚠️ 核心排版硬指标（重中之重）：
+用户明确要求：文献翻译必须采用【严格左右分栏并列中英对照】（左侧为英文原文 Original English，右侧为权威中文精译 Chinese Translation）！方便对照阅读。
+请逐章节、逐段落输出严格的中英段落对照对，完整覆盖文献的核心结论、临床方案设计、主要/次要终点数据、p值、安全性、竞争格局与估值模型。
+
+请严格按以下 JSON Schema 格式输出纯 JSON（严禁返回 Markdown 代码块标记外的无关文字）：
 {
   "chinese_title": "精炼专业的中文标题（格式：[机构/口径] 股票代码 核心研究主题/预期差结论）",
   "core_consensus_benchmark": "【投行核心观点与预期共识基准】\\n1. 符合预期（Base Case）：临床数据或财务指标关键阈值（如 ORR、PFS、安全性、营收预期）\\n2. 超预期（Bull Case）：上行催化剂与潜在超额收益驱动点\\n3. 低于预期（Bear Case）：下行风险、脱靶毒性或竞品威胁\\n4. 后续关键催化剂时间表",
-  "bilingual_markdown": "### 📖 核心章节中英对照与重点提炼\\n（保留英文核心原句，紧跟高质量中文直译，重点临床数据加粗标明）"
+  "sections": [
+    {
+      "section_title_en": "1. Executive Summary & Investment Thesis",
+      "section_title_cn": "1. 核心投资逻辑与执行摘要",
+      "pairs": [
+        {
+          "en": "English original paragraph...",
+          "cn": "对应的权威中文逐句精译..."
+        }
+      ]
+    }
+  ]
 }`;
 
   const respJsonText = callGeminiApi(
@@ -486,17 +501,25 @@ function processSingleVaultFile(sheet, vaultTab, config, ticker, stockCfg, roleL
   );
 
   const parsed = parseGeminiJson(respJsonText);
+  // 严格防空文件校验：若模型未返回有效内容或解析为空，绝对不生成 1 页空白 PDF！
+  const sectionsData = (parsed && parsed.sections && parsed.sections.length > 0) ? parsed.sections : null;
+  const fallbackMd = (parsed && parsed.bilingual_markdown) ? parsed.bilingual_markdown : "";
+  if (!sectionsData && (!fallbackMd || fallbackMd.length < 80 || fallbackMd.includes("文档解析为空"))) {
+    Logger.log(`[ABORT] Translation returned empty or invalid for ${fileName}, skipping PDF creation to avoid blank 1-page document.`);
+    return;
+  }
+
   const chineseTitle = (parsed && parsed.chinese_title) ? parsed.chinese_title : `${ticker} 投研文献中英对照 (${fileName})`;
   const coreBenchmark = (parsed && parsed.core_consensus_benchmark) ? parsed.core_consensus_benchmark : "已完成文献结构化提炼与中英对照排版。";
-  const bilingualMd = (parsed && parsed.bilingual_markdown) ? parsed.bilingual_markdown : "详见在线中英对照文档。";
 
-  // 生成排版精美的 HTML 并渲染为高质量 PDF
+  // 生成排版精美的左右分栏 HTML 并渲染为高质量 PDF
   const baseTitle = `${ticker}_${fileName.replace(/\.[^/.]+$/, "")}`;
   const styledHtml = buildBilingualReportHtml(
     chineseTitle,
     `${ticker} (${stockCfg.name}) ｜ ${roleLabel} ｜ 原始文献：${fileName}`,
     coreBenchmark,
-    bilingualMd
+    sectionsData,
+    fallbackMd
   );
 
   const pdfUrl = createBilingualPdfInDrive(stockCfg.bilingual.id, baseTitle, styledHtml);
@@ -623,16 +646,60 @@ ${textContent}
   sendPushPlus(pushToken, pushTitle, pushHtml);
 }
 
-function buildBilingualReportHtml(title, subtitle, summaryText, bodyMd) {
-  function mdToHtml(text) {
-    let s = escapeHtml(text || "");
-    s = s.replace(/^### (.+)$/gm, '<h3 style="color:#1a73e8;margin:14px 0 6px 0;font-size:14pt;">$1</h3>');
-    s = s.replace(/^## (.+)$/gm, '<h2 style="color:#174ea6;border-bottom:1px solid #d2e3fc;padding-bottom:4px;margin:18px 0 8px 0;font-size:16pt;">$1</h2>');
-    s = s.replace(/^# (.+)$/gm, '<h1 style="color:#0d47a1;margin:20px 0 10px 0;font-size:18pt;">$1</h1>');
-    s = s.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
-    s = s.replace(/^---*$/gm, '<hr style="border:none;border-top:1px solid #ccc;margin:16px 0;"/>');
-    return s.replace(/\n/g, "<br/>\n");
+function buildBilingualReportHtml(title, subtitle, summaryText, sectionsData, fallbackMd) {
+  let tableRows = "";
+
+  if (sectionsData && Array.isArray(sectionsData) && sectionsData.length > 0) {
+    for (let s = 0; s < sectionsData.length; s++) {
+      const sec = sectionsData[s];
+      const tEn = escapeHtml(sec.section_title_en || `Section ${s + 1}`);
+      const tCn = escapeHtml(sec.section_title_cn || `第 ${s + 1} 节`);
+
+      tableRows += `
+        <tr style="background:#e8f0fe;border-top:2px solid #1a73e8;border-bottom:1px solid #d2e3fc;">
+          <th style="width:50%;padding:10px 14px;text-align:left;color:#174ea6;font-size:11pt;border-right:1px solid #d2e3fc;">
+            <b>📂 ${tEn}</b>
+          </th>
+          <th style="width:50%;padding:10px 14px;text-align:left;color:#174ea6;font-size:11pt;">
+            <b>📌 ${tCn}</b>
+          </th>
+        </tr>
+      `;
+
+      const pairs = sec.pairs || [];
+      for (let p = 0; p < pairs.length; p++) {
+        const pair = pairs[p];
+        const enHtml = escapeHtml(pair.en || "").replace(/\n/g, "<br/>");
+        const cnHtml = escapeHtml(pair.cn || "").replace(/\n/g, "<br/>");
+        const bgColor = (p % 2 === 0) ? "#fcfcfc" : "#ffffff";
+
+        tableRows += `
+          <tr style="background:${bgColor};border-bottom:1px solid #e0e0e0;">
+            <td style="width:50%;padding:12px 14px;vertical-align:top;font-size:9.5pt;line-height:1.68;color:#3c4043;border-right:1px solid #e0e0e0;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;word-break:break-word;">
+              ${enHtml}
+            </td>
+            <td style="width:50%;padding:12px 14px;vertical-align:top;font-size:10pt;line-height:1.75;color:#202124;font-family:'Microsoft YaHei','PingFang SC',sans-serif;word-break:break-word;">
+              ${cnHtml}
+            </td>
+          </tr>
+        `;
+      }
+    }
+  } else if (fallbackMd) {
+    const lines = fallbackMd.split(/\n{2,}/);
+    for (let i = 0; i < lines.length; i++) {
+      const line = escapeHtml(lines[i]).replace(/\n/g, "<br/>");
+      tableRows += `
+        <tr style="border-bottom:1px solid #e0e0e0;">
+          <td colspan="2" style="padding:10px 14px;vertical-align:top;font-size:10pt;line-height:1.7;color:#202124;">
+            ${line}
+          </td>
+        </tr>
+      `;
+    }
   }
+
+  const consensusHtml = escapeHtml(summaryText || "").replace(/\n/g, "<br/>");
 
   return `<!DOCTYPE html>
 <html>
@@ -640,17 +707,36 @@ function buildBilingualReportHtml(title, subtitle, summaryText, bodyMd) {
 <meta charset="utf-8"/>
 <title>${escapeHtml(title)}</title>
 </head>
-<body style="font-family:'Microsoft YaHei','PingFang SC','Noto Sans CJK SC',Arial,sans-serif;line-height:1.75;color:#202124;font-size:11pt;max-width:850px;margin:0 auto;padding:20px;">
-  <div style="background:#e8f0fe;padding:18px 24px;border-radius:8px;margin-bottom:20px;">
-    <h1 style="margin:0 0 6px 0;font-size:18pt;color:#174ea6;">${escapeHtml(title)}</h1>
-    <p style="margin:0;font-size:10.5pt;color:#5f6368;">${escapeHtml(subtitle)}</p>
+<body style="font-family:'Microsoft YaHei','Segoe UI',Arial,sans-serif;line-height:1.6;color:#202124;padding:15px;max-width:1150px;margin:0 auto;">
+  
+  <div style="background:#1a73e8;color:#ffffff;padding:16px 20px;border-radius:6px;margin-bottom:16px;">
+    <h1 style="margin:0 0 4px 0;font-size:16pt;color:#ffffff;">${escapeHtml(title)}</h1>
+    <p style="margin:0;font-size:10pt;color:#e8f0fe;">${escapeHtml(subtitle)}</p>
   </div>
-  <div style="background:#fef7e0;border-left:5px solid #fbbc04;padding:16px 20px;margin-bottom:24px;border-radius:4px;">
-    <h2 style="margin:0 0 8px 0;font-size:13pt;color:#b06000;">📌 核心预期共识与临床数据基准（已自动注入实时监控体系）</h2>
-    <div style="font-size:11pt;color:#202124;">${mdToHtml(summaryText)}</div>
+
+  <div style="background:#fef7e0;border-left:5px solid #fbbc04;padding:14px 18px;margin-bottom:20px;border-radius:4px;">
+    <h2 style="margin:0 0 6px 0;font-size:12pt;color:#b06000;">🎯 华尔街核心观点与预期共识基准 (Consensus Bar)</h2>
+    <div style="font-size:10pt;line-height:1.68;color:#202124;">${consensusHtml}</div>
   </div>
-  <div>
-    ${mdToHtml(bodyMd)}
+
+  <table style="width:100%;border-collapse:collapse;margin:10px 0;table-layout:fixed;border:1px solid #d2e3fc;">
+    <thead>
+      <tr style="background:#f1f3f4;border-bottom:2px solid #1a73e8;">
+        <th style="width:50%;padding:12px 14px;text-align:left;font-size:11pt;color:#174ea6;border-right:1px solid #dcdcdc;">
+          🇬🇧 英文原文 (Original English)
+        </th>
+        <th style="width:50%;padding:12px 14px;text-align:left;font-size:11pt;color:#188038;">
+          🇨🇳 权威中文精译 (Chinese Translation)
+        </th>
+      </tr>
+    </thead>
+    <tbody>
+      ${tableRows}
+    </tbody>
+  </table>
+
+  <div style="margin-top:20px;text-align:center;font-size:9pt;color:#888;">
+    美股生物医药投研库 (Biotech Research Vault) ｜ 左右分栏高保真中英对照导出版
   </div>
 </body>
 </html>`;

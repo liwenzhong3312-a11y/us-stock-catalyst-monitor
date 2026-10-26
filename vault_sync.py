@@ -345,7 +345,10 @@ def translate_and_extract_pdf(api_keys, stock, role_type, file_name, pdf_bytes):
             bilingual_sections.append(f"## 📄 第 {start_p} - {end_p} 页中英对照\n\n{trans_md}")
         time.sleep(2)
 
-    full_bilingual_md = "\n\n---\n\n".join(bilingual_sections) if bilingual_sections else "（文档解析为空）"
+    if not bilingual_sections:
+        print(f"[WARN] No translated sections obtained for {file_name}. Aborting PDF creation to avoid blank 1-page document.")
+        return None, None
+    full_bilingual_md = "\n\n---\n\n".join(bilingual_sections)
 
     # 第二步：基于翻译后的全文提炼【内部官方口径 vs 外部投行共识】结构化底稿
     if "内部" in role_type:
@@ -410,16 +413,64 @@ def parse_claude_artifact_or_text(api_keys, file_name, raw_text, portfolio):
 
 
 def markdown_to_styled_html(title, subtitle, summary_text, body_md):
-    """将结构化提炼与中英对照 Markdown 转换为排版精美、适合导出 PDF 的 HTML"""
-    def md_to_html_block(text):
-        escaped = html.escape(text)
-        # 标题与粗体转换
-        escaped = re.sub(r"^### (.+)$", r'<h3 style="color:#1a73e8;margin:14px 0 6px 0;font-size:14pt;">\1</h3>', escaped, flags=re.MULTILINE)
-        escaped = re.sub(r"^## (.+)$", r'<h2 style="color:#174ea6;border-bottom:1px solid #d2e3fc;padding-bottom:4px;margin:18px 0 8px 0;font-size:16pt;">\1</h2>', escaped, flags=re.MULTILINE)
-        escaped = re.sub(r"^# (.+)$", r'<h1 style="color:#0d47a1;margin:20px 0 10px 0;font-size:18pt;">\1</h1>', escaped, flags=re.MULTILINE)
-        escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
-        escaped = re.sub(r"^---+$", r'<hr style="border:none;border-top:1px solid #ccc;margin:16px 0;"/>', escaped, flags=re.MULTILINE)
-        return escaped.replace("\n", "<br/>\n")
+    """将中英对照内容转换为高保真【左右严格分栏并列（左侧英文原文 50%，右侧中文精译 50%）】的 HTML 表格"""
+    # 将正文按照 Markdown 标题或分段拆分为行
+    sections = re.split(r"(?m)^(##+ .+)$", body_md)
+    table_rows = []
+    current_sec_title = "核心内容中英对照"
+    
+    i = 0
+    while i < len(sections):
+        part = sections[i].strip()
+        if not part:
+            i += 1
+            continue
+        if re.match(r"^##+ ", part):
+            current_sec_title = re.sub(r"^##+\s*", "", part)
+            table_rows.append(f'''
+            <tr style="background:#e8f0fe;border-top:2px solid #1a73e8;border-bottom:1px solid #d2e3fc;">
+              <th colspan="2" style="padding:10px 14px;text-align:left;color:#174ea6;font-size:11pt;">
+                📂 {html.escape(current_sec_title)}
+              </th>
+            </tr>
+            ''')
+            i += 1
+            if i < len(sections):
+                part = sections[i].strip()
+            else:
+                break
+        
+        # 拆分段落进行左右分栏对照解析
+        paras = [p.strip() for p in re.split(r"\n{2,}", part) if p.strip()]
+        for p_idx, p in enumerate(paras):
+            # 检查是否有显式的 EN / CN 标记
+            m_pair = re.search(r"(?is)(?:【?EN(?:原文)?】?|\[EN\])\s*(.*?)\s*(?:【?CN(?:精译|中文)?】?|\[CN\])\s*(.*)", p)
+            if m_pair:
+                en_col = html.escape(m_pair.group(1).strip()).replace("\n", "<br/>")
+                cn_col = html.escape(m_pair.group(2).strip()).replace("\n", "<br/>")
+            else:
+                # 默认全宽段落或自动加粗处理
+                escaped_p = html.escape(p).replace("\n", "<br/>")
+                escaped_p = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped_p)
+                en_col = escaped_p
+                cn_col = escaped_p
+
+            bg = "#fcfcfc" if p_idx % 2 == 0 else "#ffffff"
+            table_rows.append(f'''
+            <tr style="background:{bg};border-bottom:1px solid #e0e0e0;">
+              <td style="width:50%;padding:11px 14px;vertical-align:top;font-size:9.5pt;line-height:1.68;color:#3c4043;border-right:1px solid #e0e0e0;font-family:'Segoe UI',Roboto,sans-serif;word-break:break-word;">
+                {en_col}
+              </td>
+              <td style="width:50%;padding:11px 14px;vertical-align:top;font-size:10pt;line-height:1.75;color:#202124;font-family:'Microsoft YaHei','PingFang SC',sans-serif;word-break:break-word;">
+                {cn_col}
+              </td>
+            </tr>
+            ''')
+        i += 1
+
+    consensus_escaped = html.escape(summary_text).replace("\n", "<br/>")
+    consensus_escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", consensus_escaped)
+    table_content = "\n".join(table_rows)
 
     return f"""<!DOCTYPE html>
 <html>
@@ -427,17 +478,32 @@ def markdown_to_styled_html(title, subtitle, summary_text, body_md):
 <meta charset="utf-8"/>
 <title>{html.escape(title)}</title>
 </head>
-<body style="font-family:'Microsoft YaHei','PingFang SC','Noto Sans CJK SC',Arial,sans-serif;line-height:1.7;color:#202124;font-size:11pt;max-width:800px;margin:0 auto;">
-  <div style="background:#e8f0fe;padding:16px 20px;border-radius:8px;margin-bottom:18px;">
-    <h1 style="margin:0 0 6px 0;font-size:18pt;color:#174ea6;">{html.escape(title)}</h1>
-    <p style="margin:0;font-size:10.5pt;color:#5f6368;">{html.escape(subtitle)}</p>
+<body style="font-family:'Microsoft YaHei','Segoe UI',Arial,sans-serif;line-height:1.6;color:#202124;padding:15px;max-width:1150px;margin:0 auto;">
+  <div style="background:#1a73e8;color:#ffffff;padding:16px 20px;border-radius:6px;margin-bottom:16px;">
+    <h1 style="margin:0 0 4px 0;font-size:16pt;color:#ffffff;">{html.escape(title)}</h1>
+    <p style="margin:0;font-size:10pt;color:#e8f0fe;">{html.escape(subtitle)}</p>
   </div>
-  <div style="background:#fef7e0;border-left:4px solid #fbbc04;padding:14px 18px;margin-bottom:20px;border-radius:4px;">
-    <h2 style="margin:0 0 8px 0;font-size:13pt;color:#b06000;">📌 核心结构化提炼（已自动注入实时监控比对库）</h2>
-    <div style="font-size:11pt;">{md_to_html_block(summary_text)}</div>
+  <div style="background:#fef7e0;border-left:5px solid #fbbc04;padding:14px 18px;margin-bottom:20px;border-radius:4px;">
+    <h2 style="margin:0 0 6px 0;font-size:12pt;color:#b06000;">🎯 华尔街核心观点与预期共识基准 (Consensus Bar)</h2>
+    <div style="font-size:10pt;line-height:1.68;color:#202124;">{consensus_escaped}</div>
   </div>
-  <div>
-    {md_to_html_block(body_md)}
+  <table style="width:100%;border-collapse:collapse;margin:10px 0;table-layout:fixed;border:1px solid #d2e3fc;">
+    <thead>
+      <tr style="background:#f1f3f4;border-bottom:2px solid #1a73e8;">
+        <th style="width:50%;padding:12px 14px;text-align:left;font-size:11pt;color:#174ea6;border-right:1px solid #dcdcdc;">
+          🇬🇧 英文原文 (Original English)
+        </th>
+        <th style="width:50%;padding:12px 14px;text-align:left;font-size:11pt;color:#188038;">
+          🇨🇳 权威中文精译 (Chinese Translation)
+        </th>
+      </tr>
+    </thead>
+    <tbody>
+      {table_content}
+    </tbody>
+  </table>
+  <div style="margin-top:20px;text-align:center;font-size:9pt;color:#888;">
+    美股生物医药投研库 (Biotech Research Vault) ｜ 左右分栏高保真中英对照导出版
   </div>
 </body>
 </html>"""
