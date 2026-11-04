@@ -24,7 +24,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install lightweight dependencies
-        run: pip install --quiet pypdf
+        run: pip install --quiet pypdf pymupdf
 
       - name: Run Real-Time SEC, Gmail IMAP, Media & Vault Sync
         env:

@@ -1671,11 +1671,12 @@ def main(duration_minutes=0):
                         if ev["id"] not in processed_ids:
                             process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
 
-            # 2. 高频 Gmail 检查 (每 10~15 秒轮询一次，秒级捕获 IR 邮件与媒体快讯)
-            gmail_ev = fetch_gmail_imap_events(config, portfolio, processed_ids, max_age_hours=24)
-            for ev in gmail_ev:
-                if ev["id"] not in processed_ids:
-                    process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
+            # 2. Gmail 检查已交由 Google Apps Script (Tickermonitor) 原生接管；仅在显式开启 ENABLE_GMAIL_IMAP=1 时才由 Python 轮询
+            if os.environ.get("ENABLE_GMAIL_IMAP", "0") == "1":
+                gmail_ev = fetch_gmail_imap_events(config, portfolio, processed_ids, max_age_hours=24)
+                for ev in gmail_ev:
+                    if ev["id"] not in processed_ids:
+                        process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
 
             time.sleep(10)
         print(f"[INFO] Continuous Monitor Loop completed cleanly after {duration_minutes} minutes.")

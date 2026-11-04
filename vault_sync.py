@@ -32,8 +32,8 @@ SPREADSHEET_ID = os.environ.get(
 )
 
 VAULT_MODELS = [
-    "gemini-flash-latest",
     "gemini-3-flash-preview",
+    "gemini-flash-latest",
     "gemini-pro-latest",
 ]
 
@@ -686,6 +686,368 @@ def markdown_to_styled_html(title, subtitle, summary_text, body_md):
 </html>"""
 
 
+def _should_translate_pdf_text(txt, font_size):
+    if font_size < 4.5:
+        return False
+    t = txt.strip()
+    if not t:
+        return False
+    without_emails_urls = re.sub(r"https?://\S+|\S+@\S+", "", t)
+    if not re.search(r"[A-Za-z]{2,}", without_emails_urls):
+        return False
+    if re.match(r"^[A-Z]{2,5}(\s+(US|LN|equity))?$", t) and t not in (
+        "BUY",
+        "HOLD",
+        "SELL",
+        "NOTE",
+        "DATA",
+        "NEWS",
+        "RISK",
+    ):
+        return False
+    return True
+
+
+def _split_line_into_column_segments(ln):
+    spans = [s for s in ln.get("spans", []) if s.get("text", "").strip()]
+    if not spans:
+        return []
+    spans.sort(key=lambda s: s["bbox"][0])
+    segs = []
+    cur = [spans[0]]
+    for s in spans[1:]:
+        prev_x1 = cur[-1]["bbox"][2]
+        cur_x0 = s["bbox"][0]
+        if cur_x0 - prev_x1 > 12.0:
+            segs.append(cur)
+            cur = [s]
+        else:
+            cur.append(s)
+    segs.append(cur)
+    out = []
+    for seg in segs:
+        txt = " ".join(s["text"].strip() for s in seg).strip()
+        x0 = min(s["bbox"][0] for s in seg)
+        y0 = min(s["bbox"][1] for s in seg)
+        x1 = max(s["bbox"][2] for s in seg)
+        y1 = max(s["bbox"][3] for s in seg)
+        max_sz = max(float(s.get("size", 9.0)) for s in seg)
+        dom_col = int(max(seg, key=lambda s: len(s.get("text", "")))["color"])
+        bold = any(
+            "bold" in (s.get("font") or "").lower()
+            or "black" in (s.get("font") or "").lower()
+            or (int(s.get("flags", 0)) & 16)
+            for s in seg
+        )
+        out.append(
+            {
+                "bbox": [x0, y0, x1, y1],
+                "text": txt,
+                "size": max_sz,
+                "color": f"#{dom_col:06x}",
+                "bold": bold,
+            }
+        )
+    return out
+
+
+def _extract_page_translatable_blocks(page):
+    d = page.get_text("dict")
+    items = []
+    for b in d.get("blocks", []):
+        if b.get("type") != 0:
+            continue
+        lines = b.get("lines", [])
+        if not lines:
+            continue
+        bbox = list(b["bbox"])
+        bw = max(1.0, bbox[2] - bbox[0])
+
+        rows = []
+        for ln in sorted(lines, key=lambda l: (round(l["bbox"][1], 1), l["bbox"][0])):
+            ly_mid = 0.5 * (ln["bbox"][1] + ln["bbox"][3])
+            if rows and abs(ly_mid - rows[-1]["y_mid"]) <= 3.5:
+                rows[-1]["lines"].append(ln)
+            else:
+                rows.append({"y_mid": ly_mid, "lines": [ln]})
+
+        row_segments = []
+        has_multicol_row = False
+        for r in rows:
+            merged_spans = []
+            for ln in r["lines"]:
+                merged_spans.extend(ln.get("spans", []))
+            segs = _split_line_into_column_segments({"spans": merged_spans})
+            if len(segs) > 1:
+                has_multicol_row = True
+            row_segments.append(segs)
+
+        all_segs = [s for segs in row_segments for s in segs]
+        if not all_segs:
+            continue
+        sizes = [s["size"] for s in all_segs]
+        colors = {s["color"] for s in all_segs}
+        same_style = (max(sizes) - min(sizes) <= 1.5) and len(colors) == 1
+        avg_line_chars = sum(len(s["text"]) for s in all_segs) / max(1, len(rows))
+        has_contact_info = any(
+            re.search(r"@|\b\d{3}[\s.\-]\d{3}[\s.\-]\d{4}\b", s["text"])
+            for s in all_segs
+        )
+        is_unified_block = (
+            (not has_multicol_row)
+            and (not has_contact_info)
+            and len(rows) >= 2
+            and bw >= 125
+            and (avg_line_chars >= 26 or (same_style and bw >= 220))
+        )
+
+        if is_unified_block:
+            full_txt = " ".join(s["text"] for s in all_segs).strip()
+            max_sz = max(sizes, default=9.0)
+            if not _should_translate_pdf_text(full_txt, max_sz):
+                continue
+            first_seg = all_segs[0]
+            items.append(
+                {
+                    "id": len(items),
+                    "bbox": bbox,
+                    "max_x1": bbox[2] + 4.0,
+                    "size": max_sz,
+                    "color": first_seg["color"],
+                    "bold": first_seg["bold"],
+                    "text": full_txt,
+                    "align": "left",
+                    "redact_rects": [list(ln["bbox"]) for ln in lines],
+                }
+            )
+        else:
+            for segs in row_segments:
+                for idx_s, seg in enumerate(segs):
+                    if not _should_translate_pdf_text(seg["text"], seg["size"]):
+                        continue
+                    if idx_s + 1 < len(segs):
+                        next_x0 = segs[idx_s + 1]["bbox"][0]
+                        max_x1 = max(seg["bbox"][2] + 2.0, next_x0 - 3.0)
+                    else:
+                        max_x1 = min(
+                            page.rect.width - 10.0,
+                            max(seg["bbox"][2] + 25.0, bbox[2] + 4.0),
+                        )
+                    align = (
+                        "right"
+                        if (
+                            len(segs) > 1
+                            and idx_s == len(segs) - 1
+                            and seg["bbox"][0] > page.rect.width * 0.55
+                        )
+                        else "left"
+                    )
+                    items.append(
+                        {
+                            "id": len(items),
+                            "bbox": seg["bbox"],
+                            "max_x1": max_x1,
+                            "size": seg["size"],
+                            "color": seg["color"],
+                            "bold": seg["bold"],
+                            "text": seg["text"],
+                            "align": align,
+                            "redact_rects": [seg["bbox"]],
+                        }
+                    )
+    return items
+
+
+def translate_pdf_preserve_layout_side_by_side(
+    api_keys, stock, role_type, file_name, raw_pdf_bytes
+):
+    """
+    原版排版 100% 保留的【左英文原版页面 + 右同版式中文原位替换页面】双拼 PDF 翻译引擎：
+    - 保留原 PDF 的全部图片、临床图表、公司 Logo、配色、表格框线与坐标布局；
+    - 页面上所有可翻译文本在原坐标框内原位替换为简体中文（不浓缩、不删减）；
+    - 每一页左半侧为 100% 原始英文页面，右半侧为同版式中文页面，严格左右对照。
+    """
+    import pymupdf
+
+    src_doc = pymupdf.open(stream=raw_pdf_bytes, filetype="pdf")
+    trans_doc = pymupdf.open(stream=raw_pdf_bytes, filetype="pdf")
+
+    all_page_items = {}
+    payload_blocks = []
+    for pno in range(len(trans_doc)):
+        items = _extract_page_translatable_blocks(trans_doc[pno])
+        all_page_items[pno] = items
+        for it in items:
+            payload_blocks.append((f"P{pno}_{it['id']}", it["text"]))
+
+    if not payload_blocks:
+        # 若为纯扫描图片 PDF（无可提取文本块），回退到多模态拆解并仅对右页叠加说明
+        summary, bilingual_md = translate_and_extract_pdf(
+            api_keys, stock, role_type, file_name, raw_pdf_bytes
+        )
+        return None, summary, bilingual_md
+
+    trans_map = {}
+    BATCH_SIZE = 40
+    for i in range(0, len(payload_blocks), BATCH_SIZE):
+        batch = payload_blocks[i : i + BATCH_SIZE]
+        input_str = "\n".join(f"<<<{k}>>>\n{txt}" for k, txt in batch)
+        prompt = (
+            f"你是一位华尔街顶级生物医药分析师与专业同声传译。当前正在原位翻译 {stock['ticker']} ({stock['company']}) 的【{role_type}】文献（{file_name}）。\n"
+            "请将以下带有 <<<ID>>> 标记的 PDF 英文文本块逐一完整精准地翻译为简体中文。\n"
+            "核心要求：\n"
+            "1. 必须保留原有的每个 <<<ID>>> 标记（格式严格为 <<<ID>>> 独占一行，紧跟对应的中文译文），严禁漏掉任何一个 ID！\n"
+            "2. 严禁浓缩、严禁删减任何句子或临床数据，保留所有临床试验名称、药物名称、靶点、数字、货币符号。\n"
+            "3. 纯人名与邮箱地址保持英文原样，职位、部门、表头、图表标题、免责声明等全部译为简明精准的中文。\n\n"
+            f"{input_str}"
+        )
+        resp_text, _ = call_gemini_with_rotation(
+            api_keys, prompt, expect_json=False, deep_thinking=False
+        )
+        if resp_text:
+            matches = re.findall(
+                r"<<<(P\d+_\d+)>>>\s*([\s\S]*?)(?=(?:<<<P\d+_\d+>>>)|\Z)", resp_text
+            )
+            for k, v in matches:
+                trans_map[k.strip()] = v.strip()
+
+    for pno, items in all_page_items.items():
+        page = trans_doc[pno]
+        for it in items:
+            key = f"P{pno}_{it['id']}"
+            cn = trans_map.get(key, "").strip()
+            if not cn or cn == it["text"].strip():
+                continue
+            for rrect in it["redact_rects"]:
+                rx0, ry0, rx1, ry1 = rrect
+                rh = max(1.0, ry1 - ry0)
+                pad_y = min(1.5, rh * 0.18)
+                page.add_redact_annot(
+                    pymupdf.Rect(rx0, ry0 + pad_y, rx1, ry1 - pad_y), fill=False
+                )
+        page.apply_redactions(
+            images=pymupdf.PDF_REDACT_IMAGE_NONE,
+            graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+        )
+        for it in items:
+            key = f"P{pno}_{it['id']}"
+            cn = trans_map.get(key, "").strip()
+            if not cn or cn == it["text"].strip():
+                continue
+            x0, y0, x1, y1 = it["bbox"]
+            if it["align"] == "right":
+                rect = pymupdf.Rect(
+                    max(10.0, x0 - 30.0),
+                    max(0, y0 - 1.5),
+                    x1 + 2.0,
+                    min(page.rect.height - 2, y1 + 3.0),
+                )
+            else:
+                rect = pymupdf.Rect(
+                    x0,
+                    max(0, y0 - 1.5),
+                    it["max_x1"],
+                    min(page.rect.height - 2, y1 + 3.0),
+                )
+            esc_cn = html.escape(cn).replace("\n", "<br/>")
+            weight = "bold" if it["bold"] else "normal"
+            font_sz = max(5.5, min(16.0, it["size"] * 0.94))
+            css = (
+                f"* {{ font-family: sans-serif; font-size: {font_sz:.1f}pt; "
+                f"color: {it['color']}; font-weight: {weight}; text-align: {it['align']}; line-height: 1.24; margin: 0; padding: 0; }}"
+            )
+            page.insert_htmlbox(rect, f"<div>{esc_cn}</div>", css=css, scale_low=0.35)
+
+    dual_doc = pymupdf.open()
+    for pno in range(len(src_doc)):
+        r = src_doc[pno].rect
+        w, h = r.width, r.height
+        out_page = dual_doc.new_page(width=w * 2, height=h)
+        out_page.show_pdf_page(pymupdf.Rect(0, 0, w, h), src_doc, pno)
+        out_page.show_pdf_page(pymupdf.Rect(w, 0, w * 2, h), trans_doc, pno)
+        out_page.draw_line(
+            pymupdf.Point(w, 0),
+            pymupdf.Point(w, h),
+            color=(0.75, 0.78, 0.82),
+            width=1.0,
+        )
+
+    dual_pdf_bytes = dual_doc.tobytes(garbage=3, deflate=True)
+
+    # 提炼核心摘要供 Vault 表格与微信推送展示
+    sample_cn = "\n".join(
+        trans_map.get(k, "") for k, _ in payload_blocks[:45] if trans_map.get(k)
+    )[:12000]
+    summary_prompt = (
+        f"请根据以下 {stock['ticker']} ({stock['company']}) 的【{role_type}】（{file_name}）译文内容，"
+        f"用 250 字以内精炼概括其核心临床数据/里程碑节点与投行核心预期基准（严禁敏感交易荐股词汇）：\n\n{sample_cn}"
+    )
+    summary_text, _ = call_gemini_with_rotation(
+        api_keys, summary_prompt, expect_json=False, deep_thinking=False
+    )
+    return dual_pdf_bytes, (summary_text or sample_cn[:350]), ""
+
+
+def upload_pdf_bytes_to_drive(
+    access_token, output_folder_id, base_title, pdf_bytes, existing_file_id=None
+):
+    """直接将二进制 PDF 上传（或覆盖更新）到指定文件夹，命名为 <源文件名>[译].pdf"""
+    boundary = "===AntigravityVaultBoundary==="
+    clean_base = re.sub(r"(\[译\]|【译】)+$", "", base_title.strip())
+    pdf_meta = {
+        "name": f"{clean_base}[译].pdf",
+        "mimeType": "application/pdf",
+    }
+    if not existing_file_id:
+        pdf_meta["parents"] = [output_folder_id]
+
+    pdf_multipart = (
+        (
+            f"--{boundary}\r\n"
+            f"Content-Type: application/json; charset=UTF-8\r\n\r\n"
+            f"{json.dumps(pdf_meta, ensure_ascii=False)}\r\n"
+            f"--{boundary}\r\n"
+            f"Content-Type: application/pdf\r\n\r\n"
+        ).encode("utf-8")
+        + pdf_bytes
+        + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    )
+
+    if existing_file_id:
+        upload_url = f"https://www.googleapis.com/upload/drive/v3/files/{existing_file_id}?uploadType=multipart&fields=id,name,webViewLink"
+        method = "PATCH"
+    else:
+        upload_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink"
+        method = "POST"
+
+    pdf_info = None
+    for attempt in range(3):
+        try:
+            req_pdf = urllib.request.Request(
+                upload_url,
+                data=pdf_multipart,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": f"multipart/related; boundary={boundary}",
+                },
+                method=method,
+            )
+            with urllib.request.urlopen(req_pdf, timeout=90) as resp:
+                pdf_info = json.loads(resp.read().decode("utf-8"))
+            if pdf_info and "id" in pdf_info:
+                break
+        except urllib.error.HTTPError as e:
+            if attempt < 2 and e.code in (500, 502, 503, 504):
+                time.sleep(3 * (attempt + 1))
+                continue
+            raise
+
+    pdf_link = pdf_info.get(
+        "webViewLink", f"https://drive.google.com/file/d/{pdf_info['id']}/view"
+    )
+    return pdf_link, pdf_link
+
+
 def create_bilingual_doc_and_pdf_in_drive(access_token, output_folder_id, base_title, html_content):
     """
     利用 Google Drive 官方云端渲染引擎生成单一纯净的【中英对照PDF】：
@@ -971,15 +1333,18 @@ def sync_drive_vault(access_token, config, portfolio, send_pushplus_fn=None):
                         or "powerpoint" in mime_low
                     )
 
+                    dual_pdf_bytes = None
+                    summary = ""
+                    bilingual_md = ""
                     if is_pdf:
                         raw_bytes = download_drive_file_bytes(access_token, fmeta)
-                        summary, bilingual_md = translate_and_extract_pdf(
+                        dual_pdf_bytes, summary, bilingual_md = translate_pdf_preserve_layout_side_by_side(
                             api_keys, stock, role_label, fname, raw_bytes
                         )
                     elif is_office:
                         try:
                             pdf_bytes = convert_office_file_to_pdf_bytes(access_token, fmeta)
-                            summary, bilingual_md = translate_and_extract_pdf(
+                            dual_pdf_bytes, summary, bilingual_md = translate_pdf_preserve_layout_side_by_side(
                                 api_keys, stock, role_label, fname, pdf_bytes
                             )
                         except Exception as conv_err:
@@ -1000,23 +1365,29 @@ def sync_drive_vault(access_token, config, portfolio, send_pushplus_fn=None):
                         )
                         summary = (bilingual_md or "")[:400]
 
-                    if not bilingual_md or len(bilingual_md.strip()) < 80 or "文档解析为空" in bilingual_md:
-                        print(f"[WARN] Skipping PDF creation for {fname}: translation empty or invalid.")
-                        continue
-
-                    styled_html = markdown_to_styled_html(
-                        f"[{ticker}] {base_name} (中英对照精译版)",
-                        f"标的：{ticker} ({stock['company']}) ｜ 口径分类：{role_label} ｜ 原始文件：{fname}",
-                        summary,
-                        bilingual_md,
-                    )
-                    # 直接在源文件所在文件夹 (folder_id) 内生成 <源文件名>[译].pdf
-                    pdf_link, doc_link = create_bilingual_doc_and_pdf_in_drive(
-                        access_token,
-                        folder_id,
-                        base_name,
-                        styled_html,
-                    )
+                    if dual_pdf_bytes:
+                        pdf_link, doc_link = upload_pdf_bytes_to_drive(
+                            access_token,
+                            folder_id,
+                            base_name,
+                            dual_pdf_bytes,
+                        )
+                    else:
+                        if not bilingual_md or len(bilingual_md.strip()) < 80 or "文档解析为空" in bilingual_md:
+                            print(f"[WARN] Skipping PDF creation for {fname}: translation empty or invalid.")
+                            continue
+                        styled_html = markdown_to_styled_html(
+                            f"[{ticker}] {base_name} (中英对照精译版)",
+                            f"标的：{ticker} ({stock['company']}) ｜ 口径分类：{role_label} ｜ 原始文件：{fname}",
+                            summary,
+                            bilingual_md,
+                        )
+                        pdf_link, doc_link = create_bilingual_doc_and_pdf_in_drive(
+                            access_token,
+                            folder_id,
+                            base_name,
+                            styled_html,
+                        )
                     existing_names.add(f"{base_name}[译].pdf")
                     bj_time = (
                         datetime.datetime.now(datetime.timezone.utc)
