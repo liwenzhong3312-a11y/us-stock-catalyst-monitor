@@ -44,6 +44,11 @@ const VAULT_STOCK_FOLDERS = {
     name: "Veradermics",
     internal: { id: "1B9kEYHpqlVvBT1WmD68tmZXyYnAnU--g", label: "公司内部官方口径 (Deck/Transcript)" },
     external: { id: "194waR4OjgxvbUfw7Ahd9pCCrfX3H-pUK", label: "外部投行与独立研报 (Sell-Side)" }
+  },
+  "PBLS": {
+    name: "Parabilis Medicines, Inc.",
+    internal: { id: "1syr5vn-tY6IM0co8Rayx_oWL4k5WCiut", label: "公司内部官方口径 (Deck/Transcript)" },
+    external: { id: "16xiXzLULdzL7cA7ungR-rhHz0yzFqXsc", label: "外部投行与独立研报 (Sell-Side)" }
   }
 };
 

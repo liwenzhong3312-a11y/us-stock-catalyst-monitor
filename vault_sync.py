@@ -118,11 +118,59 @@ def is_translated_or_temp_file(fname):
     return False
 
 
-def ensure_vault_folders(access_token, portfolio):
-    """确保 Google Drive 投研库及所有持仓标的子目录完整存在（同时支持识别用户在云盘手动新建的标的文件夹）"""
-    root = drive_find_or_create_folder(
-        access_token, "美股生物医药投研库 (Biotech Research Vault)"
+VAULT_ROOT_FOLDER_ID = "182XirR1PicM8j0m1cvVAAWDNl0U_2HAg"
+
+
+def _resolve_stock_subfolders(access_token, stock_folder_id):
+    """智能识别标的子目录（兼容用户自定义的 '公司内部官方口径' / '外部投行与独立研报' 或带 '01_'/'02_' 前缀的目录名）"""
+    q_sub = (
+        f"mimeType='application/vnd.google-apps.folder' and "
+        f"'{stock_folder_id}' in parents and trashed=false"
     )
+    url_sub = "https://www.googleapis.com/drive/v3/files?" + urllib.parse.urlencode(
+        {"q": q_sub, "fields": "files(id,name,webViewLink)", "pageSize": 50}
+    )
+    subs = http_json(
+        url_sub, headers={"Authorization": f"Bearer {access_token}"}
+    ).get("files", [])
+
+    f_internal = None
+    f_external = None
+    for s in subs:
+        sname = s.get("name", "")
+        if not f_internal and any(k in sname for k in ("内部", "官方", "01_", "Deck", "Transcript")):
+            f_internal = s
+        elif not f_external and any(k in sname for k in ("外部", "投行", "研报", "02_", "SellSide")):
+            f_external = s
+
+    if not f_internal:
+        f_internal = drive_find_or_create_folder(
+            access_token, "01_公司内部官方口径 (Deck_Transcript_SEC)", stock_folder_id
+        )
+    if not f_external:
+        f_external = drive_find_or_create_folder(
+            access_token, "02_外部投行与独立研报 (SellSide_Consensus)", stock_folder_id
+        )
+    return f_internal, f_external
+
+
+def ensure_vault_folders(access_token, portfolio):
+    """确保 Google Drive 投研库及所有持仓标的子目录完整存在（同时支持识别用户在云盘手动新建的标的文件夹并双向同步至 Portfolio 表）"""
+    root = None
+    try:
+        r_meta = http_json(
+            f"https://www.googleapis.com/drive/v3/files/{VAULT_ROOT_FOLDER_ID}?fields=id,name,webViewLink,trashed",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        if r_meta and not r_meta.get("trashed"):
+            root = r_meta
+    except Exception:
+        pass
+    if not root:
+        root = drive_find_or_create_folder(
+            access_token, "生物医药资料库 (Biotech Research Vault)"
+        )
+
     sync_folder = drive_find_or_create_folder(
         access_token, "00_网站与催化剂底稿同步 (Claude_Artifact_Sync)", root["id"]
     )
@@ -147,7 +195,12 @@ def ensure_vault_folders(access_token, portfolio):
         matched_folder = None
         for ef in existing_root_folders:
             ef_name = ef.get("name", "").strip()
-            if ef_name.upper() == ticker or ef_name.upper().startswith(f"{ticker}_") or ef_name.upper().startswith(f"{ticker}-") or ef_name.upper().startswith(f"{ticker} "):
+            if (
+                ef_name.upper() == ticker
+                or ef_name.upper().startswith(f"{ticker}_")
+                or ef_name.upper().startswith(f"{ticker}-")
+                or ef_name.upper().startswith(f"{ticker} ")
+            ):
                 matched_folder = ef
                 break
         sf = (
@@ -156,12 +209,7 @@ def ensure_vault_folders(access_token, portfolio):
             else drive_find_or_create_folder(access_token, folder_name, root["id"])
         )
 
-        f_internal = drive_find_or_create_folder(
-            access_token, "01_公司内部官方口径 (Deck_Transcript_SEC)", sf["id"]
-        )
-        f_external = drive_find_or_create_folder(
-            access_token, "02_外部投行与独立研报 (SellSide_Consensus)", sf["id"]
-        )
+        f_internal, f_external = _resolve_stock_subfolders(access_token, sf["id"])
         stocks_map[ticker] = {
             "stock": stock,
             "folder": sf,
@@ -169,7 +217,7 @@ def ensure_vault_folders(access_token, portfolio):
             "external": f_external,
         }
 
-    # 自动发现用户在 Google Drive 根目录下手动新建的标的文件夹（即使尚未写入 Portfolio 表也自动建立子目录并纳入翻译监测）
+    # 自动发现用户在 Google Drive 根目录下手动新建的标的文件夹（如 PBLS 等），自动补齐子目录并双向同步至 Portfolio 表
     for ef in existing_root_folders:
         ef_name = ef.get("name", "").strip()
         if ef_name.startswith("00_") or ef_name.startswith("."):
@@ -181,23 +229,42 @@ def ensure_vault_folders(access_token, portfolio):
         if tk_up in stocks_map:
             continue
         comp_label = (m_tk.group(2) or tk_up).strip()
-        f_internal = drive_find_or_create_folder(
-            access_token, "01_公司内部官方口径 (Deck_Transcript_SEC)", ef["id"]
-        )
-        f_external = drive_find_or_create_folder(
-            access_token, "02_外部投行与独立研报 (SellSide_Consensus)", ef["id"]
-        )
+        f_internal, f_external = _resolve_stock_subfolders(access_token, ef["id"])
+        new_stock_obj = {
+            "ticker": tk_up,
+            "company": comp_label,
+            "company_clean": comp_label,
+            "exchange": "NASDAQ",
+            "keywords": [tk_up, comp_label],
+            "avg_cost": "未设置",
+            "pos_note": "云盘新建自动同步",
+        }
         stocks_map[tk_up] = {
-            "stock": {
-                "ticker": tk_up,
-                "company": comp_label,
-                "company_clean": comp_label,
-                "drugs": [],
-            },
+            "stock": new_stock_obj,
             "folder": ef,
             "internal": f_internal,
             "external": f_external,
         }
+        portfolio.append(new_stock_obj)
+        # 自动将该新标的追加到 Google Sheet Portfolio 表，实现双向全自动同步
+        try:
+            append_url = (
+                f"https://sheets.googleapis.com/v4/spreadsheets/{SPREADSHEET_ID}"
+                f"/values/{urllib.parse.quote('Portfolio!A:G')}:append?valueInputOption=USER_ENTERED"
+            )
+            http_json(
+                append_url,
+                method="POST",
+                headers={"Authorization": f"Bearer {access_token}"},
+                payload={
+                    "values": [
+                        [tk_up, comp_label, "NASDAQ", comp_label, "", "云盘手动新建自动纳管", "YES"]
+                    ]
+                },
+            )
+            print(f"[INFO] Auto-registered new Drive stock folder '{ef_name}' ({tk_up}) into Portfolio sheet.")
+        except Exception as e:
+            print(f"[WARN] Auto-registering {tk_up} to Portfolio failed: {e}")
 
     return {"root": root, "sync_folder": sync_folder, "stocks": stocks_map}
 
