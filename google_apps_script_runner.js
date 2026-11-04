@@ -22,33 +22,38 @@ const GEMINI_MODELS = [
   "gemini-pro-latest"
 ];
 
-// Google Drive 投研库固定目录映射表（4 只核心持仓标的）
+// Google Drive 投研库根目录与固定目录映射表（同时支持从 Portfolio 表动态发现新标的）
+const VAULT_ROOT_FOLDER_ID = "182XirR1PicM8j0m1cvVAAWDNl0U_2HAg";
 const VAULT_STOCK_FOLDERS = {
   "ABSI": {
     name: "Absci Corporation",
     internal: { id: "142Lcae_wj_cfsUxXe8BW8J5I123ZTcgP", label: "公司内部官方口径 (Deck/Transcript)" },
-    external: { id: "1r4ZSC9q0Odndn8DKzUrrEktOTzZgPhYA", label: "外部投行与独立研报 (Sell-Side)" },
-    bilingual: { id: "1VbjKn69YtCHAYH05Epuz3DNVsiL6pt_K" }
+    external: { id: "1r4ZSC9q0Odndn8DKzUrrEktOTzZgPhYA", label: "外部投行与独立研报 (Sell-Side)" }
   },
   "ARWR": {
     name: "Arrowhead Pharmaceuticals",
     internal: { id: "18l7CPc9wc9h-260n5uEqzhWcR87BGDNI", label: "公司内部官方口径 (Deck/Transcript)" },
-    external: { id: "1ThZ_uJQoMMv4_Su3j2tKpZ0BVsaSfF_E", label: "外部投行与独立研报 (Sell-Side)" },
-    bilingual: { id: "1_dgRw3v2w6LgsqZrrN4twh00_I4HKEv9" }
+    external: { id: "1ThZ_uJQoMMv4_Su3j2tKpZ0BVsaSfF_E", label: "外部投行与独立研报 (Sell-Side)" }
   },
   "KRYS": {
     name: "Krystal Biotech",
     internal: { id: "1424s8jY16FRaeWEp4WXl9N6Wd5quzDVx", label: "公司内部官方口径 (Deck/Transcript)" },
-    external: { id: "1_5ASngeC32HPbzeuX-A3K7EmjAoVXxiZ", label: "外部投行与独立研报 (Sell-Side)" },
-    bilingual: { id: "15xeGhLRd8N1AT2oy__OtvUR94jmW_iM8" }
+    external: { id: "1_5ASngeC32HPbzeuX-A3K7EmjAoVXxiZ", label: "外部投行与独立研报 (Sell-Side)" }
   },
   "MANE": {
     name: "Veradermics",
     internal: { id: "1B9kEYHpqlVvBT1WmD68tmZXyYnAnU--g", label: "公司内部官方口径 (Deck/Transcript)" },
-    external: { id: "194waR4OjgxvbUfw7Ahd9pCCrfX3H-pUK", label: "外部投行与独立研报 (Sell-Side)" },
-    bilingual: { id: "1oAHz2v8QZBR__b3ntUm5E71cmJgDACzs" }
+    external: { id: "194waR4OjgxvbUfw7Ahd9pCCrfX3H-pUK", label: "外部投行与独立研报 (Sell-Side)" }
   }
 };
+
+function isTranslatedOrTempFile(fname) {
+  if (!fname) return true;
+  const base = fname.replace(/\.[^/.]+$/, "").trim();
+  if (/(\[译\]|【译】|\[中英对照\]|【中英对照】)$/.test(base)) return true;
+  if (fname.includes("[译].") || fname.includes("【译】.") || fname.includes("【中英对照PDF】") || fname.includes("_temp_")) return true;
+  return false;
+}
 
 const VAULT_SYNC_FOLDER_ID = "1x-3gF5g8ceE3Z8oulNKBuMEyNHfGxAtF";
 
@@ -422,16 +427,18 @@ function runDriveVaultScan(sheet, config, startTime) {
       while (files.hasNext()) {
         if (isDriveTimeout()) break;
         const file = files.next();
+        const fname = file.getName();
+        if (isTranslatedOrTempFile(fname)) continue;
         const fileId = file.getId();
         const modifiedStr = file.getLastUpdated().toISOString().substring(0, 16);
         const vId = "VAULT_" + fileId + "_" + modifiedStr;
 
         if (processedVids.has(vId)) continue;
 
-        // 发现新文件！立即启动自动中英对照翻译与 PDF 渲染
+        // 发现新文件！立即在当前源文件夹内启动自动中英对照翻译与 <源文件名>[译].pdf 渲染
         foundNewFile = true;
-        Logger.log(`[VAULT] Processing new file: [${ticker}] ${file.getName()} (${folderMeta.label})`);
-        processSingleVaultFile(sheet, vaultTab, config, ticker, stockCfg, folderMeta.label, file, vId);
+        Logger.log(`[VAULT] Processing new file: [${ticker}] ${fname} (${folderMeta.label})`);
+        processSingleVaultFile(sheet, vaultTab, config, ticker, stockCfg, folderMeta.id, folderMeta.label, file, vId);
         break; // 每次执行处理 1 份文件，保证 30 秒内稳妥完成并推送
       }
     }
@@ -445,6 +452,7 @@ function runDriveVaultScan(sheet, config, startTime) {
       while (syncFiles.hasNext()) {
         if (isDriveTimeout()) break;
         const sFile = syncFiles.next();
+        if (isTranslatedOrTempFile(sFile.getName())) continue;
         const sId = sFile.getId();
         const sMod = sFile.getLastUpdated().toISOString().substring(0, 16);
         const svId = "SYNC_" + sId + "_" + sMod;
@@ -458,7 +466,7 @@ function runDriveVaultScan(sheet, config, startTime) {
   }
 }
 
-function processSingleVaultFile(sheet, vaultTab, config, ticker, stockCfg, roleLabel, file, vId) {
+function processSingleVaultFile(sheet, vaultTab, config, ticker, stockCfg, sourceFolderId, roleLabel, file, vId) {
   const fileName = file.getName();
   const fileSize = file.getSize();
   const mimeType = file.getMimeType() || "application/pdf";
@@ -519,8 +527,8 @@ function processSingleVaultFile(sheet, vaultTab, config, ticker, stockCfg, roleL
   const chineseTitle = (parsed && parsed.chinese_title) ? parsed.chinese_title : `${ticker} 投研文献中英对照 (${fileName})`;
   const coreBenchmark = (parsed && parsed.core_consensus_benchmark) ? parsed.core_consensus_benchmark : "已完成文献结构化提炼与中英对照排版。";
 
-  // 生成排版精美的左右分栏 HTML 并渲染为高质量 PDF
-  const baseTitle = `${ticker}_${fileName.replace(/\.[^/.]+$/, "")}`;
+  // 生成排版精美的左右分栏 HTML 并在原始文件夹内直接渲染为 <源文件名>[译].pdf
+  const baseTitle = fileName.replace(/\.[^/.]+$/, "");
   const styledHtml = buildBilingualReportHtml(
     chineseTitle,
     `${ticker} (${stockCfg.name}) ｜ ${roleLabel} ｜ 原始文献：${fileName}`,
@@ -529,7 +537,7 @@ function processSingleVaultFile(sheet, vaultTab, config, ticker, stockCfg, roleL
     fallbackMd
   );
 
-  const pdfUrl = createBilingualPdfInDrive(stockCfg.bilingual.id, baseTitle, styledHtml);
+  const pdfUrl = createBilingualPdfInDrive(sourceFolderId, baseTitle, styledHtml);
 
   // 记录到 Google Sheet Vault 表
   const bjTimeStr = formatDateTime(new Date());
@@ -617,9 +625,9 @@ ${textContent}
   const title = (parsed && parsed.title) ? parsed.title : fileName;
   const summary = (parsed && parsed.summary) ? parsed.summary : textContent.substring(0, 300);
 
-  const stockCfg = VAULT_STOCK_FOLDERS[ticker] || VAULT_STOCK_FOLDERS["ABSI"];
-  const styledHtml = buildBilingualReportHtml(title, `网站与催化剂底稿同步 ｜ ${fileName}`, summary, textContent);
-  const pdfUrl = createBilingualPdfInDrive(stockCfg.bilingual.id, `${ticker}_${fileName.replace(/\.[^/.]+$/, "")}`, styledHtml);
+  const baseTitle = fileName.replace(/\.[^/.]+$/, "");
+  const styledHtml = buildBilingualReportHtml(title, `网站与催化剂底稿同步 ｜ ${fileName}`, summary, null, textContent);
+  const pdfUrl = createBilingualPdfInDrive(VAULT_SYNC_FOLDER_ID, baseTitle, styledHtml);
 
   const bjTimeStr = formatDateTime(new Date());
   vaultTab.appendRow([
@@ -788,7 +796,8 @@ function createBilingualPdfInDrive(folderId, baseTitle, htmlContent) {
         muteHttpExceptions: true
       });
 
-      const pdfBlob = pdfRes.getBlob().setName("【中英对照PDF】" + baseTitle + ".pdf");
+      const cleanBase = baseTitle.replace(/(\[译\]|【译】)+$/, "");
+      const pdfBlob = pdfRes.getBlob().setName(cleanBase + "[译].pdf");
       const targetFolder = DriveApp.getFolderById(folderId);
       const pdfFile = targetFolder.createFile(pdfBlob);
       pdfFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
@@ -805,8 +814,9 @@ function createBilingualPdfInDrive(folderId, baseTitle, htmlContent) {
 
   // 备选降级方案
   try {
-    const blob = Utilities.newBlob(htmlContent, "text/html", baseTitle + ".html").getAs("application/pdf");
-    blob.setName("【中英对照PDF】" + baseTitle + ".pdf");
+    const cleanBase = baseTitle.replace(/(\[译\]|【译】)+$/, "");
+    const blob = Utilities.newBlob(htmlContent, "text/html", cleanBase + ".html").getAs("application/pdf");
+    blob.setName(cleanBase + "[译].pdf");
     const targetFolder = DriveApp.getFolderById(folderId);
     const pdfFile = targetFolder.createFile(blob);
     pdfFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);

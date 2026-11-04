@@ -97,8 +97,29 @@ def drive_find_or_create_folder(access_token, name, parent_id=None):
     )
 
 
+def is_translated_or_temp_file(fname):
+    """判断文件是否为已生成的翻译稿或临时转换文件，防止重复死循环翻译"""
+    if not fname:
+        return True
+    base = os.path.splitext(fname)[0].strip()
+    if base.endswith(("[译]", "【译】", "[中英对照]", "【中英对照】")):
+        return True
+    if any(
+        tag in fname
+        for tag in (
+            "[译].",
+            "【译】.",
+            "【中英对照PDF】",
+            "_temp_bilingual_",
+            "_temp_office_conv_",
+        )
+    ):
+        return True
+    return False
+
+
 def ensure_vault_folders(access_token, portfolio):
-    """确保 Google Drive 投研库及所有持仓标的子目录完整存在"""
+    """确保 Google Drive 投研库及所有持仓标的子目录完整存在（同时支持识别用户在云盘手动新建的标的文件夹）"""
     root = drive_find_or_create_folder(
         access_token, "美股生物医药投研库 (Biotech Research Vault)"
     )
@@ -106,22 +127,34 @@ def ensure_vault_folders(access_token, portfolio):
         access_token, "00_网站与催化剂底稿同步 (Claude_Artifact_Sync)", root["id"]
     )
     stocks_map = {}
+
+    # 先拉取根目录下现有的全部子文件夹，避免重复查询并支持自动发现用户手动新建的标的文件夹
+    q_all = (
+        f"mimeType='application/vnd.google-apps.folder' and "
+        f"'{root['id']}' in parents and trashed=false"
+    )
+    url_all = "https://www.googleapis.com/drive/v3/files?" + urllib.parse.urlencode(
+        {"q": q_all, "fields": "files(id,name,webViewLink)", "pageSize": 200}
+    )
+    existing_root_folders = http_json(
+        url_all, headers={"Authorization": f"Bearer {access_token}"}
+    ).get("files", [])
+
     for stock in portfolio:
-        ticker = stock["ticker"]
+        ticker = stock["ticker"].strip().upper()
         clean_comp = re.sub(r"[^A-Za-z0-9]+", "", stock["company_clean"].split()[0])
         folder_name = f"{ticker}_{clean_comp}" if clean_comp else ticker
-        # 先查找是否已有以 TICKER_ 开头的文件夹
-        q = (
-            f"mimeType='application/vnd.google-apps.folder' and "
-            f"name contains '{ticker}_' and '{root['id']}' in parents and trashed=false"
+        matched_folder = None
+        for ef in existing_root_folders:
+            ef_name = ef.get("name", "").strip()
+            if ef_name.upper() == ticker or ef_name.upper().startswith(f"{ticker}_") or ef_name.upper().startswith(f"{ticker}-") or ef_name.upper().startswith(f"{ticker} "):
+                matched_folder = ef
+                break
+        sf = (
+            matched_folder
+            if matched_folder
+            else drive_find_or_create_folder(access_token, folder_name, root["id"])
         )
-        url = "https://www.googleapis.com/drive/v3/files?" + urllib.parse.urlencode(
-            {"q": q, "fields": "files(id,name,webViewLink)"}
-        )
-        existing = http_json(
-            url, headers={"Authorization": f"Bearer {access_token}"}
-        ).get("files", [])
-        sf = existing[0] if existing else drive_find_or_create_folder(access_token, folder_name, root["id"])
 
         f_internal = drive_find_or_create_folder(
             access_token, "01_公司内部官方口径 (Deck_Transcript_SEC)", sf["id"]
@@ -129,16 +162,43 @@ def ensure_vault_folders(access_token, portfolio):
         f_external = drive_find_or_create_folder(
             access_token, "02_外部投行与独立研报 (SellSide_Consensus)", sf["id"]
         )
-        f_bilingual = drive_find_or_create_folder(
-            access_token, "03_中英对照译文与解析 (Bilingual_Output)", sf["id"]
-        )
         stocks_map[ticker] = {
             "stock": stock,
             "folder": sf,
             "internal": f_internal,
             "external": f_external,
-            "bilingual": f_bilingual,
         }
+
+    # 自动发现用户在 Google Drive 根目录下手动新建的标的文件夹（即使尚未写入 Portfolio 表也自动建立子目录并纳入翻译监测）
+    for ef in existing_root_folders:
+        ef_name = ef.get("name", "").strip()
+        if ef_name.startswith("00_") or ef_name.startswith("."):
+            continue
+        m_tk = re.match(r"^([A-Za-z]{2,6})(?:[_\-\s]+(.*))?$", ef_name)
+        if not m_tk:
+            continue
+        tk_up = m_tk.group(1).upper()
+        if tk_up in stocks_map:
+            continue
+        comp_label = (m_tk.group(2) or tk_up).strip()
+        f_internal = drive_find_or_create_folder(
+            access_token, "01_公司内部官方口径 (Deck_Transcript_SEC)", ef["id"]
+        )
+        f_external = drive_find_or_create_folder(
+            access_token, "02_外部投行与独立研报 (SellSide_Consensus)", ef["id"]
+        )
+        stocks_map[tk_up] = {
+            "stock": {
+                "ticker": tk_up,
+                "company": comp_label,
+                "company_clean": comp_label,
+                "drugs": [],
+            },
+            "folder": ef,
+            "internal": f_internal,
+            "external": f_external,
+        }
+
     return {"root": root, "sync_folder": sync_folder, "stocks": stocks_map}
 
 
@@ -626,8 +686,9 @@ def create_bilingual_doc_and_pdf_in_drive(access_token, output_folder_id, base_t
         except Exception:
             pass
 
+    clean_base = re.sub(r"(\[译\]|【译】)+$", "", base_title.strip())
     pdf_meta = {
-        "name": f"【中英对照PDF】{base_title}.pdf",
+        "name": f"{clean_base}[译].pdf",
         "mimeType": "application/pdf",
         "parents": [output_folder_id],
     }
@@ -720,9 +781,15 @@ def sync_drive_vault(access_token, config, portfolio, send_pushplus_fn=None):
 
     # 1. 巡检 00_网站与催化剂底稿同步 (Claude_Artifact_Sync)
     sync_files = list_folder_files(access_token, vault_tree["sync_folder"]["id"])
+    existing_sync_names = {f["name"] for f in sync_files}
     for fmeta in sync_files:
         if processed_count >= 2:
             break
+        if is_translated_or_temp_file(fmeta["name"]):
+            continue
+        base_name = os.path.splitext(fmeta["name"])[0]
+        if f"{base_name}[译].pdf" in existing_sync_names:
+            continue
         v_id = f"SYNC_{fmeta['id']}_{fmeta.get('modifiedTime', '')[:16]}"
         if v_id in processed_vault_ids:
             continue
@@ -741,25 +808,25 @@ def sync_drive_vault(access_token, config, portfolio, send_pushplus_fn=None):
             matched = parsed.get("matched_tickers") or ["ABSI"]
             per_notes = parsed.get("per_ticker_notes") or {}
             bilingual_md = parsed.get("bilingual_markdown") or raw_text[:4000]
-            base_name = os.path.splitext(fmeta["name"])[0]
+
+            # 直接在原始目录生成 <源文件名>[译].pdf
+            combined_notes = "\n\n".join(
+                f"【{k}】{v}" for k, v in per_notes.items()
+            ) or "已同步网站催化剂与共识底稿"
+            styled_html = markdown_to_styled_html(
+                f"网站催化剂与预期共识底稿 ({base_name})",
+                f"来源：00_网站与催化剂底稿同步 ｜ 原始文件：{fmeta['name']}",
+                combined_notes,
+                bilingual_md,
+            )
+            pdf_link, doc_link = create_bilingual_doc_and_pdf_in_drive(
+                access_token, vault_tree["sync_folder"]["id"], base_name, styled_html
+            )
+            existing_sync_names.add(f"{base_name}[译].pdf")
 
             for tk in matched:
                 tk_up = str(tk).upper()
                 tk_note = per_notes.get(tk_up) or next(iter(per_notes.values()), "已同步网站催化剂与共识底稿")
-                out_folder_id = (
-                    vault_tree["stocks"][tk_up]["bilingual"]["id"]
-                    if tk_up in vault_tree["stocks"]
-                    else vault_tree["sync_folder"]["id"]
-                )
-                styled_html = markdown_to_styled_html(
-                    f"{tk_up} 网站催化剂与预期共识底稿 ({base_name})",
-                    f"来源：00_网站与催化剂底稿同步 ｜ 原始文件：{fmeta['name']}",
-                    tk_note,
-                    bilingual_md,
-                )
-                pdf_link, doc_link = create_bilingual_doc_and_pdf_in_drive(
-                    access_token, out_folder_id, f"{tk_up}_{base_name}", styled_html
-                )
                 bj_time = (
                     datetime.datetime.now(datetime.timezone.utc)
                     + datetime.timedelta(hours=8)
@@ -786,9 +853,9 @@ def sync_drive_vault(access_token, config, portfolio, send_pushplus_fn=None):
                         push_token,
                         f"📚【网站底稿已同步】{tk_up} | {base_name[:22]}",
                         f"<div style='font-family:sans-serif;line-height:1.68;font-size:14px;'>"
-                        f"<p>已自动解析您上传的网站/催化剂底稿 <b>{html.escape(fmeta['name'])}</b> 并注入实时监控比对库：</p>"
+                        f"<p>已自动解析您上传的网站/催化剂底稿 <b>{html.escape(fmeta['name'])}</b> 并于同目录生成 <b>{html.escape(base_name)}[译].pdf</b>：</p>"
                         f"<div style='background:rgba(128,128,128,0.12);border-left:4px solid #f59e0b;padding:10px 12px;margin:10px 0;border-radius:4px;white-space:pre-wrap;'>{html.escape(tk_note)}</div>"
-                        f"<p><a href='{pdf_link}'>📄 点击打开/下载中英对照 PDF</a></p>"
+                        f"<p><a href='{pdf_link}'>📄 点击打开/下载 {html.escape(base_name)}[译].pdf</a></p>"
                         f"</div>",
                     )
             processed_vault_ids.add(v_id)
@@ -796,22 +863,29 @@ def sync_drive_vault(access_token, config, portfolio, send_pushplus_fn=None):
         except Exception as e:
             print(f"[WARN] Failed syncing website artifact {fmeta['name']}: {e}")
 
-    # 2. 巡检各持仓标的的 01_公司内部官方口径 与 02_外部投行与独立研报
+    # 2. 巡检各持仓标的的 01_公司内部官方口径、02_外部投行与独立研报（以及标的根目录直接放入的文件）
     for ticker, s_folders in vault_tree["stocks"].items():
         stock = s_folders["stock"]
         for role_key, role_label in [
             ("internal", "公司内部官方口径 (Deck/Transcript)"),
             ("external", "外部投行与独立研报 (Sell-Side)"),
+            ("folder", "标的主目录直接上传文档"),
         ]:
             folder_id = s_folders[role_key]["id"]
             files = list_folder_files(access_token, folder_id)
+            existing_names = {f["name"] for f in files}
             for fmeta in files:
                 if processed_count >= 2:
                     break
+                fname = fmeta["name"]
+                if is_translated_or_temp_file(fname):
+                    continue
+                base_name = os.path.splitext(fname)[0]
+                if f"{base_name}[译].pdf" in existing_names:
+                    continue
                 v_id = f"VAULT_{fmeta['id']}_{fmeta.get('modifiedTime', '')[:16]}"
                 if v_id in processed_vault_ids:
                     continue
-                fname = fmeta["name"]
                 mime = fmeta.get("mimeType", "")
                 print(f"[INFO] Translating & indexing new vault file for {ticker} ({role_label}): {fname}")
                 try:
@@ -863,19 +937,20 @@ def sync_drive_vault(access_token, config, portfolio, send_pushplus_fn=None):
                         print(f"[WARN] Skipping PDF creation for {fname}: translation empty or invalid.")
                         continue
 
-                    base_name = os.path.splitext(fname)[0]
                     styled_html = markdown_to_styled_html(
                         f"[{ticker}] {base_name} (中英对照精译版)",
                         f"标的：{ticker} ({stock['company']}) ｜ 口径分类：{role_label} ｜ 原始文件：{fname}",
                         summary,
                         bilingual_md,
                     )
+                    # 直接在源文件所在文件夹 (folder_id) 内生成 <源文件名>[译].pdf
                     pdf_link, doc_link = create_bilingual_doc_and_pdf_in_drive(
                         access_token,
-                        s_folders["bilingual"]["id"],
-                        f"{ticker}_{base_name}",
+                        folder_id,
+                        base_name,
                         styled_html,
                     )
+                    existing_names.add(f"{base_name}[译].pdf")
                     bj_time = (
                         datetime.datetime.now(datetime.timezone.utc)
                         + datetime.timedelta(hours=8)
@@ -902,9 +977,9 @@ def sync_drive_vault(access_token, config, portfolio, send_pushplus_fn=None):
                             push_token,
                             f"📚【中英对照PDF已生成】{ticker} | {base_name[:20]}",
                             f"<div style='font-family:sans-serif;line-height:1.68;font-size:14px;'>"
-                            f"<p><b>标的：</b>{ticker} ({stock['company']})<br/><b>口径分类：</b>{role_label}<br/><b>原始文件：</b>{html.escape(fname)}</p>"
+                            f"<p><b>标的：</b>{ticker} ({stock['company']})<br/><b>口径分类：</b>{role_label}<br/><b>原始文件：</b>{html.escape(fname)}<br/><b>生成译稿：</b>{html.escape(base_name)}[译].pdf（已保存在同文件夹内）</p>"
                             f"<div style='background:rgba(128,128,128,0.12);border-left:4px solid #f59e0b;padding:10px 12px;margin:10px 0;border-radius:4px;white-space:pre-wrap;font-size:14px;'><b>【核心结构化提炼】</b>\n{html.escape(summary)}</div>"
-                            f"<p style='margin-top:10px;'><a href='{pdf_link}'>👉 点击打开/下载中英对照 PDF</a></p>"
+                            f"<p style='margin-top:10px;'><a href='{pdf_link}'>👉 点击打开/下载 {html.escape(base_name)}[译].pdf</a></p>"
                             f"</div>",
                         )
                     processed_vault_ids.add(v_id)
