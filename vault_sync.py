@@ -972,7 +972,11 @@ def translate_pdf_preserve_layout_side_by_side(
             width=1.0,
         )
 
-    dual_pdf_bytes = dual_doc.tobytes(garbage=3, deflate=True)
+    try:
+        dual_doc.subset_fonts()
+    except Exception:
+        pass
+    dual_pdf_bytes = dual_doc.tobytes(garbage=4, deflate=True, deflate_fonts=True)
 
     # 提炼核心摘要供 Vault 表格与微信推送展示
     sample_cn = "\n".join(
