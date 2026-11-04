@@ -58,12 +58,20 @@ def http_json(url, method="GET", headers=None, payload=None, timeout=60):
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req_headers.setdefault("Content-Type", "application/json; charset=utf-8")
-    req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
-        if not raw:
-            return {}
-        return json.loads(raw.decode("utf-8", errors="replace"))
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+                if not raw:
+                    return {}
+                return json.loads(raw.decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError:
+            raise
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(1.5 * (attempt + 1))
 
 
 def drive_find_or_create_folder(access_token, name, parent_id=None):
@@ -326,11 +334,15 @@ def translate_and_extract_pdf(api_keys, stock, role_type, file_name, pdf_bytes):
     for start_p, end_p, chunk_bytes in chunks:
         chunk_prompt = f"""你正在处理生物科技公司 {stock['ticker']} ({stock['company']}) 的【{role_type}】原始英文 PDF 文档（文件名：{file_name}，当前分块：第 {start_p} 至 {end_p} 页）。
 
-请逐页/逐节输出高可读性的【中英对照精译版】（使用清晰的 Markdown 格式）：
-1. 对每一页（Slide / Page）标明页码与小标题。
-2. 采用“**【EN 原文要点/段落】** -> **【CN 中文精译】**”的上下对照结构，完整翻译该页的所有实质文字、临床试验设计、终点数据、p值、剂量、不良反应表格、财务与现金流数据。
-3. 如果某页包含关键数据图表或对比表格，请用 Markdown 表格或清晰的要点将其数据完整还原并翻译为中文。
-4. 自动忽略纯装饰性封面、空白页或冗长的标准法律免责声明页（仅用一句话注记即可）。
+请逐页/逐节输出严格对应的【左右双栏中英对照精译版】：
+1. 对每一页（Slide / Page）或章节，先用三级标题标明页码与小标题：`### Page {start_p} - 小标题`
+2. 必须将每一段或每一个核心要点的【英文原文】与【中文精译】严格使用 `[EN]` 和 `[CN]` 标签成对输出（系统将据此自动渲染为左侧英文原文、右侧中文精译的并列双栏表格）：
+[EN]
+（此处完整摘录该段/该要点的英文原文 Original English，保留所有临床试验数据、p值、终点指标与药名）
+[CN]
+（此处输出对应的权威简体中文逐句精译 Chinese Translation，准确翻译所有医学术语、临床设计与财务数据）
+3. 如果某页包含关键数据图表或对比表格，请在 `[EN]` 中还原英文指标与数值，在 `[CN]` 中输出对应的中文指标与数值。
+4. 自动忽略纯装饰性封面、空白页或冗长的标准法律免责声明页。
 5. 全文严禁使用“炒股、买入、卖出、加仓、暴涨、暴跌”等敏感字眼。"""
 
         trans_md, _ = call_gemini_with_rotation(
@@ -342,7 +354,7 @@ def translate_and_extract_pdf(api_keys, stock, role_type, file_name, pdf_bytes):
             deep_thinking=False,
         )
         if trans_md:
-            bilingual_sections.append(f"## 📄 第 {start_p} - {end_p} 页中英对照\n\n{trans_md}")
+            bilingual_sections.append(f"## 📄 第 {start_p} - {end_p} 页中英对照 (Pages {start_p}-{end_p})\n\n{trans_md}")
         time.sleep(2)
 
     if not bilingual_sections:
@@ -412,21 +424,36 @@ def parse_claude_artifact_or_text(api_keys, file_name, raw_text, portfolio):
     return None
 
 
+def _format_cell_md(raw_str):
+    escaped = html.escape((raw_str or "").strip()).replace("\n", "<br/>")
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
+    return escaped
+
+
 def markdown_to_styled_html(title, subtitle, summary_text, body_md):
     """将中英对照内容转换为高保真【左右严格分栏并列（左侧英文原文 50%，右侧中文精译 50%）】的 HTML 表格"""
-    # 将正文按照 Markdown 标题或分段拆分为行
-    sections = re.split(r"(?m)^(##+ .+)$", body_md)
+    if not body_md:
+        body_md = ""
+    # 将正文按照 Markdown 二级/三级标题拆分为章节
+    sections = re.split(r"(?m)^(#{2,3}\s+.+)$", body_md)
     table_rows = []
     current_sec_title = "核心内容中英对照"
-    
+
+    pair_pattern = re.compile(
+        r"(?:\*\*)*\s*(?:\[EN(?:_START)?\]|【EN[^】]*】)\s*(?:\*\*)*\s*:?\s*(.*?)\s*"
+        r"(?:->\s*)?(?:\*\*)*\s*(?:\[CN(?:_START)?\]|【CN[^】]*】)\s*(?:\*\*)*\s*:?\s*(.*?)"
+        r"(?=(?:\*\*)*\s*(?:\[EN(?:_START)?\]|【EN[^】]*】)|\Z)",
+        re.DOTALL | re.IGNORECASE,
+    )
+
     i = 0
     while i < len(sections):
         part = sections[i].strip()
         if not part:
             i += 1
             continue
-        if re.match(r"^##+ ", part):
-            current_sec_title = re.sub(r"^##+\s*", "", part)
+        if re.match(r"^#{2,3}\s+", part):
+            current_sec_title = re.sub(r"^#{2,3}\s*", "", part)
             table_rows.append(f'''
             <tr style="background:#e8f0fe;border-top:2px solid #1a73e8;border-bottom:1px solid #d2e3fc;">
               <th colspan="2" style="padding:10px 14px;text-align:left;color:#174ea6;font-size:11pt;">
@@ -439,33 +466,56 @@ def markdown_to_styled_html(title, subtitle, summary_text, body_md):
                 part = sections[i].strip()
             else:
                 break
-        
-        # 拆分段落进行左右分栏对照解析
-        paras = [p.strip() for p in re.split(r"\n{2,}", part) if p.strip()]
-        for p_idx, p in enumerate(paras):
-            # 检查是否有显式的 EN / CN 标记
-            m_pair = re.search(r"(?is)(?:【?EN(?:原文)?】?|\[EN\])\s*(.*?)\s*(?:【?CN(?:精译|中文)?】?|\[CN\])\s*(.*)", p)
-            if m_pair:
-                en_col = html.escape(m_pair.group(1).strip()).replace("\n", "<br/>")
-                cn_col = html.escape(m_pair.group(2).strip()).replace("\n", "<br/>")
-            else:
-                # 默认全宽段落或自动加粗处理
-                escaped_p = html.escape(p).replace("\n", "<br/>")
-                escaped_p = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped_p)
-                en_col = escaped_p
-                cn_col = escaped_p
 
-            bg = "#fcfcfc" if p_idx % 2 == 0 else "#ffffff"
-            table_rows.append(f'''
-            <tr style="background:{bg};border-bottom:1px solid #e0e0e0;">
-              <td style="width:50%;padding:11px 14px;vertical-align:top;font-size:9.5pt;line-height:1.68;color:#3c4043;border-right:1px solid #e0e0e0;font-family:'Segoe UI',Roboto,sans-serif;word-break:break-word;">
-                {en_col}
-              </td>
-              <td style="width:50%;padding:11px 14px;vertical-align:top;font-size:10pt;line-height:1.75;color:#202124;font-family:'Microsoft YaHei','PingFang SC',sans-serif;word-break:break-word;">
-                {cn_col}
-              </td>
-            </tr>
-            ''')
+        # 优先在章节全文中提取所有 [EN] ... [CN] ... 对照块（不受段落间空行影响）
+        matches = list(pair_pattern.finditer(part))
+        if matches:
+            for p_idx, m in enumerate(matches):
+                en_raw = re.sub(r"\[EN_END\]|\[CN_END\]", "", m.group(1)).strip()
+                cn_raw = re.sub(r"\[EN_END\]|\[CN_END\]", "", m.group(2)).strip()
+                en_col = _format_cell_md(en_raw)
+                cn_col = _format_cell_md(cn_raw)
+                bg = "#fcfcfc" if p_idx % 2 == 0 else "#ffffff"
+                table_rows.append(f'''
+                <tr style="background:{bg};border-bottom:1px solid #e0e0e0;">
+                  <td style="width:50%;padding:11px 14px;vertical-align:top;font-size:9.5pt;line-height:1.68;color:#3c4043;border-right:1px solid #e0e0e0;font-family:'Segoe UI',Roboto,sans-serif;word-break:break-word;">
+                    {en_col}
+                  </td>
+                  <td style="width:50%;padding:11px 14px;vertical-align:top;font-size:10pt;line-height:1.75;color:#202124;font-family:'Microsoft YaHei','PingFang SC',sans-serif;word-break:break-word;">
+                    {cn_col}
+                  </td>
+                </tr>
+                ''')
+        else:
+            # 若无显式 [EN]/[CN] 标签，按段落智能分离英文行与中文行，或跨两列展示，绝不在左右两栏重复同一段文字
+            paras = [p.strip() for p in re.split(r"\n{2,}", part) if p.strip() and p.strip() != "---"]
+            for p_idx, p in enumerate(paras):
+                lines = [ln.strip() for ln in p.splitlines() if ln.strip()]
+                en_lines = [ln for ln in lines if not re.search(r"[\u4e00-\u9fa5]", ln)]
+                cn_lines = [ln for ln in lines if re.search(r"[\u4e00-\u9fa5]", ln)]
+                bg = "#fcfcfc" if p_idx % 2 == 0 else "#ffffff"
+                if en_lines and cn_lines:
+                    en_col = _format_cell_md("\n".join(en_lines))
+                    cn_col = _format_cell_md("\n".join(cn_lines))
+                    table_rows.append(f'''
+                    <tr style="background:{bg};border-bottom:1px solid #e0e0e0;">
+                      <td style="width:50%;padding:11px 14px;vertical-align:top;font-size:9.5pt;line-height:1.68;color:#3c4043;border-right:1px solid #e0e0e0;font-family:'Segoe UI',Roboto,sans-serif;word-break:break-word;">
+                        {en_col}
+                      </td>
+                      <td style="width:50%;padding:11px 14px;vertical-align:top;font-size:10pt;line-height:1.75;color:#202124;font-family:'Microsoft YaHei','PingFang SC',sans-serif;word-break:break-word;">
+                        {cn_col}
+                      </td>
+                    </tr>
+                    ''')
+                else:
+                    full_col = _format_cell_md(p)
+                    table_rows.append(f'''
+                    <tr style="background:{bg};border-bottom:1px solid #e0e0e0;">
+                      <td colspan="2" style="padding:11px 14px;vertical-align:top;font-size:10pt;line-height:1.72;color:#202124;font-family:'Microsoft YaHei','Segoe UI',sans-serif;word-break:break-word;">
+                        {full_col}
+                      </td>
+                    </tr>
+                    ''')
         i += 1
 
     consensus_escaped = html.escape(summary_text).replace("\n", "<br/>")
@@ -795,7 +845,7 @@ def sync_drive_vault(access_token, config, portfolio, send_pushplus_fn=None):
                             print(f"[WARN] Office-to-PDF conversion fallback for {fname}: {conv_err}")
                             raw_bytes = download_drive_file_bytes(access_token, fmeta)
                             text_content = extract_docx_text(raw_bytes) or raw_bytes.decode("utf-8", errors="replace")
-                            prompt = f"""请将以下 {ticker} ({stock['company']}) 的【{role_label}】文档（{fname}）逐段翻译为中英对照格式，并在开头提炼 300 字以内的核心要点（区分内部承诺或外部投行预期阈值）：\n\n{text_content[:25000]}"""
+                            prompt = f"""请将以下 {ticker} ({stock['company']}) 的【{role_label}】文档（{fname}）逐段翻译为严格左右双栏中英对照格式（每段严格使用 [EN] 英文原文 与 [CN] 中文精译 标签成对输出），并在开头提炼 300 字以内的核心要点（区分内部承诺或外部投行预期阈值）：\n\n{text_content[:25000]}"""
                             bilingual_md, _ = call_gemini_with_rotation(
                                 api_keys, prompt, expect_json=False, deep_thinking=True
                             )
@@ -803,11 +853,15 @@ def sync_drive_vault(access_token, config, portfolio, send_pushplus_fn=None):
                     else:
                         raw_bytes = download_drive_file_bytes(access_token, fmeta)
                         text_content = raw_bytes.decode("utf-8", errors="replace")
-                        prompt = f"""请将以下 {ticker} ({stock['company']}) 的【{role_label}】文档（{fname}）逐段翻译为中英对照格式，并在开头提炼 300 字以内的核心要点（区分内部承诺或外部投行预期阈值）：\n\n{text_content[:25000]}"""
+                        prompt = f"""请将以下 {ticker} ({stock['company']}) 的【{role_label}】文档（{fname}）逐段翻译为严格左右双栏中英对照格式（每段严格使用 [EN] 英文原文 与 [CN] 中文精译 标签成对输出），并在开头提炼 300 字以内的核心要点（区分内部承诺或外部投行预期阈值）：\n\n{text_content[:25000]}"""
                         bilingual_md, _ = call_gemini_with_rotation(
                             api_keys, prompt, expect_json=False, deep_thinking=True
                         )
                         summary = (bilingual_md or "")[:400]
+
+                    if not bilingual_md or len(bilingual_md.strip()) < 80 or "文档解析为空" in bilingual_md:
+                        print(f"[WARN] Skipping PDF creation for {fname}: translation empty or invalid.")
+                        continue
 
                     base_name = os.path.splitext(fname)[0]
                     styled_html = markdown_to_styled_html(

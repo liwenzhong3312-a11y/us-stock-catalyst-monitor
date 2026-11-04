@@ -2,15 +2,13 @@ name: US Stock Catalyst 24x7 Cloud Monitor
 
 on:
   schedule:
-    # 1. 美股盘前+开盘黄金窗口（北京时间 18:00 - 23:00 / 美东 06:00 - 11:00 AM）：每 12 分钟接力常驻
-    - cron: '*/12 10-14 * * 1-5'
-    # 2. 美股盘后公告黄金窗口（北京时间 04:00 - 06:00 / 美东 16:00 - 18:00 PM）：每 12 分钟接力常驻
-    - cron: '*/12 20-21 * * 1-5'
-    # 3. 工作日其余时段：每 20 分钟接力常驻
-    - cron: '*/20 0-9,15-19,22-23 * * 1-5'
-    # 4. 周末（医学大会与突发交易）：每 2 小时常规巡检
-    - cron: '0 */2 * * 6,0'
+    # 7x24 小时全天候每 15 分钟兜底唤醒（配合脚本内 14 分钟常驻流式轮询 + 自动接力 workflow_dispatch）
+    - cron: '*/15 * * * *'
   workflow_dispatch:
+
+concurrency:
+  group: us-stock-catalyst-monitor-singleton
+  cancel-in-progress: false
 
 jobs:
   monitor:

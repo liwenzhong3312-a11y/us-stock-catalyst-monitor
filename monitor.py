@@ -56,9 +56,20 @@ def http_json(url, method="GET", headers=None, payload=None, timeout=30):
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req_headers.setdefault("Content-Type", "application/json; charset=utf-8")
-    req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8", errors="replace"))
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+                if not raw:
+                    return {}
+                return json.loads(raw.decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError:
+            raise
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(1.5 * (attempt + 1))
 
 
 # 官方新闻通讯社电头与官方信源域名列表
@@ -1574,6 +1585,36 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
         processed_titles.add(norm_title)
 
 
+def trigger_next_github_relay(config):
+    """在 14 分钟常驻循环结束前自动触发下一棒 GitHub Actions workflow_dispatch，消除 GitHub cron 延迟"""
+    gh_pat = (config.get("GITHUB_PAT") or os.environ.get("GITHUB_PAT") or "").strip()
+    if not gh_pat:
+        return
+    headers = {
+        "Authorization": f"Bearer {gh_pat}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "AntigravityBiotechMonitor/3.0",
+    }
+    try:
+        # 检查是否已有排队中的任务，避免重复堆积
+        runs_url = "https://api.github.com/repos/liwenzhong3312-a11y/us-stock-catalyst-monitor/actions/runs?status=queued&per_page=5"
+        res = http_json(runs_url, headers=headers, timeout=10)
+        if res.get("total_count", 0) > 0:
+            print("[INFO] Next GitHub Actions run is already queued, skipping self-dispatch.")
+            return
+        disp_url = "https://api.github.com/repos/liwenzhong3312-a11y/us-stock-catalyst-monitor/actions/workflows/monitor.yml/dispatches"
+        req = urllib.request.Request(
+            disp_url,
+            data=json.dumps({"ref": "main"}).encode("utf-8"),
+            headers={**headers, "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            print(f"[INFO] Successfully triggered next 24x7 GitHub Actions relay (HTTP {resp.status}).")
+    except Exception as e:
+        print(f"[WARN] GitHub relay dispatch skipped: {e}")
+
+
 def main(duration_minutes=0):
     access_token = get_google_access_token()
     config, portfolio, processed_ids, processed_titles = load_sheet_state(access_token)
@@ -1605,9 +1646,18 @@ def main(duration_minutes=0):
         while time.time() < end_time:
             now_t = time.time()
 
-            # 1. 优先检查 SEC EDGAR & Yahoo Finance RSS 一手完整官方新闻稿 (每 60 秒轮询一次)
+            # 1. 每 60 秒轮询一次：Google Drive 投研库新增文献自动翻译 + SEC EDGAR + Yahoo Finance RSS
             if now_t - last_rss_sec_check >= 60:
                 last_rss_sec_check = now_t
+                if os.environ.get("SYNC_DRIVE_VAULT", "0") == "1":
+                    try:
+                        from vault_sync import sync_drive_vault
+                        vault_knowledge = sync_drive_vault(
+                            access_token, config, portfolio, send_pushplus_fn=send_pushplus
+                        )
+                    except Exception as ve:
+                        print(f"[WARN] Periodic vault sync check error: {ve}")
+
                 for stock in portfolio:
                     cik = cik_map.get(stock["ticker"])
                     sec_ev = fetch_sec_edgar_events(stock, cik, max_age_hours=24)
@@ -1629,6 +1679,7 @@ def main(duration_minutes=0):
 
             time.sleep(10)
         print(f"[INFO] Continuous Monitor Loop completed cleanly after {duration_minutes} minutes.")
+        trigger_next_github_relay(config)
         return
 
     # 单次巡检模式 (duration_minutes == 0)
