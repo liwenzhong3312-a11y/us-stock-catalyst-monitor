@@ -64,12 +64,18 @@ def http_json(url, method="GET", headers=None, payload=None, timeout=30):
 # 官方新闻通讯社电头与官方信源域名列表
 OFFICIAL_WIRES_PAT = r"(?i)\b(BUSINESS WIRE|GLOBE NEWSWIRE|GlobeNewswire|PR Newswire|PRNewswire|ACCESSWIRE)\b"
 OFFICIAL_IR_DOMAINS = [
+    "gcs-web.com",
     "alert.gcs-web.com",
+    "notification.gcs-web.com",
     "notified.com",
     "q4inc.com",
     "equisolve.com",
     "issuerdirect.com",
     "sec.gov",
+    "krystalbio.com",
+    "arrowheadpharma.com",
+    "absci.com",
+    "veradermics.com",
 ]
 
 # 专业生物医药行业媒体域名（用于提炼【行业速览】）
@@ -643,14 +649,14 @@ def has_substantive_body(title, body_en):
     if t_norm and t_norm in b_norm.lower():
         idx = b_norm.lower().find(t_norm)
         b_norm = (b_norm[:idx] + " " + b_norm[idx + len(t_norm):]).strip()
-    # 移除网址与常见引导点击短语
+    # 移除网址与常见引导点击短语及 IR 邮件空壳套话
     b_norm = re.sub(r"https?://\S+", "", b_norm)
     b_norm = re.sub(
-        r"(?i)\b(read now|full article|click here|view presentation|slideshow|transcript)\b",
+        r"(?i)\b(read now|full article|click here to view all releases|click here|view this release|view all releases|powered by notified|view presentation|slideshow|transcript)\b",
         "",
         b_norm,
     ).strip()
-    return len(b_norm) >= 160
+    return len(b_norm) >= 180
 
 
 def fetch_yahoo_direct_news(stock, max_age_hours=24):
@@ -843,9 +849,9 @@ def fetch_gmail_imap_events(config, portfolio, processed_ids, max_age_hours=24):
                     source_label = f"第三方资讯：{sender[:35]}"
                 source_tier = "第三方媒体快讯"
 
-            # 若为一手官方 IR 邮件且正文偏短（<250字符），自动提取超链接抓取官网全文或 SEC 申报
+            # 若为一手官方 IR 邮件且正文偏短或无实质正文，自动提取超链接抓取官网全文或 SEC 申报
             article_url = "https://mail.google.com/mail/u/0/#inbox"
-            if is_official and len(cleaned_body) < 250 and raw_html:
+            if is_official and (len(cleaned_body) < 450 or not has_substantive_body(subject, cleaned_body)) and raw_html:
                 links = re.findall(r'href=["\'](https?://[^"\']+)["\']', raw_html)
                 for l in links:
                     if not any(x in l.lower() for x in ["unsubscribe", "privacy", "manage", "twitter", "linkedin"]):
@@ -870,9 +876,15 @@ def fetch_gmail_imap_events(config, portfolio, processed_ids, max_age_hours=24):
                     continue
 
                 has_sub = has_substantive_body(subject, cleaned_body)
-                # 针对匹配到标的的第三方突发快讯（如 BMO 评级变动），只要非纯空白（>=20字符）即推事实，但标记 has_substantive_body
-                if len(cleaned_body.strip()) < 20 and not has_sub:
-                    print(f"[INFO] Skipping completely empty shell email for {matched_stock['ticker']}: {subject}")
+                # 拦截纯引导点击的 IR 链接空壳邮件（如仅含 "View this release -> or click here to view all releases. Powered by Notified"）
+                is_ir_link_stub = bool(
+                    re.search(
+                        r"(?i)(view this release|view all releases|powered by notified|查看本新闻稿|查看所有新闻稿)",
+                        cleaned_body,
+                    )
+                )
+                if not has_sub and (is_official or is_ir_link_stub or len(cleaned_body.strip()) < 20):
+                    print(f"[INFO] Skipping link-stub or empty shell email for {matched_stock['ticker']}: {subject}")
                     processed_ids.add(ev_id)
                     continue
 
@@ -1235,9 +1247,10 @@ def format_body_for_wechat_html(text):
                 if rs > 1:
                     attrs.append(f'rowspan="{rs}"')
                 align = "center" if (is_header and val) else "left"
+                bg_th = "background:rgba(128,128,128,0.12);" if is_header else ""
                 attr_str = (" " + " ".join(attrs)) if attrs else ""
                 t_html.append(
-                    f'<{tag}{attr_str} style="border:1px solid #666;padding:4px 6px;text-align:{align};vertical-align:middle;">{c_esc}</{tag}>'
+                    f'<{tag}{attr_str} style="border:1px solid rgba(128,128,128,0.4);{bg_th}padding:5px 7px;text-align:{align};vertical-align:middle;">{c_esc}</{tag}>'
                 )
                 c_idx += cs
             t_html.append("</tr>")
@@ -1245,9 +1258,16 @@ def format_body_for_wechat_html(text):
         out_parts.append("".join(t_html))
         table_rows = []
 
+    # 将可能连在同一行内的多个项目符号（如 " • "）拆分为独立行，保证每个要点独立分段
+    normalized_text = re.sub(r"([^\n])\s+•\s+", r"\1\n• ", text)
+    lines = normalized_text.splitlines()
+
     in_opening_highlights = True
     for ln in lines:
         s = ln.strip()
+        if not s:
+            flush_table()
+            continue
         if re.match(r"^【(核心要点|新闻稿完整正文).*】$", s):
             continue
         if s.startswith("|") and s.endswith("|") and s.count("|") >= 2:
@@ -1257,12 +1277,19 @@ def format_body_for_wechat_html(text):
             flush_table()
             if re.search(r"(--\s*\(|（美国商业资讯）|（环球电讯社）|（美通社）|BUSINESS WIRE|GLOBE NEWSWIRE)", s):
                 in_opening_highlights = False
-            esc = html.escape(ln)
+            # 处理 Markdown 标题行（如 ### 1. 🎯 ...）
+            if s.startswith("#"):
+                h_clean = re.sub(r"^#+\s*", "", s)
+                esc = html.escape(h_clean)
+                esc = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc)
+                out_parts.append(f'<div style="font-weight:bold;margin:10px 0 4px 0;">{esc}</div>')
+                continue
+            esc = html.escape(s)
             esc = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc)
             # 确保开头导语中的所有 • 要点 (Highlights) 强制以粗体展示
             if in_opening_highlights and s.startswith(("•", "·", "* ")) and "<b>" not in esc:
                 esc = f"<b>{esc}</b>"
-            out_parts.append(esc)
+            out_parts.append(f'<div style="margin:6px 0;">{esc}</div>')
     flush_table()
     return "\n".join(out_parts)
 
@@ -1372,15 +1399,15 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
         pub_time_str = format_pub_time(ev.get("published_at"), time_label="邮件发送时间")
         html_body = f"""
         <div style="font-family:sans-serif;line-height:1.68;font-size:14px;">
-          <p style="margin:0 0 6px 0;font-size:13px;">
+          <p style="margin:0 0 6px 0;font-size:13px;opacity:0.85;">
             <b>{html.escape(media_name)}</b> ｜ 生科行业要闻速览<br/>
             🕒 {html.escape(pub_time_str)}<br/>
             📡 信源：{html.escape(ev['source'])}
           </p>
-          <hr style="border:none;border-top:1px solid #555;margin:8px 0;"/>
-          <div style="margin:8px 0;font-size:14px;white-space:pre-wrap;">{format_body_for_wechat_html(digest_text)}</div>
-          <hr style="border:none;border-top:1px solid #555;margin:8px 0;"/>
-          <p style="margin:4px 0;font-size:13px;">
+          <hr style="border:none;border-top:1px solid rgba(128,128,128,0.3);margin:8px 0;"/>
+          <div style="margin:8px 0;font-size:14px;">{format_body_for_wechat_html(digest_text)}</div>
+          <hr style="border:none;border-top:1px solid rgba(128,128,128,0.3);margin:8px 0;"/>
+          <p style="margin:4px 0;font-size:13px;opacity:0.85;">
             <a href="{ev['url']}">🔗 查看原始邮件</a> ｜ <a href="https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit">📊 云端历史归档表</a>
           </p>
         </div>
@@ -1409,8 +1436,13 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
     # 分支 B：持仓标的个股催化剂（【官方】 vs 【第三方】）
     stock = ev["stock"]
     is_official = is_official_event(ev)
-    title_prefix = "【官方】" if is_official else "【第三方】"
-    deep_prefix = "【官方·解读】" if is_official else "【第三方·解读】"
+
+    # 标题防重复：在调用大模型前先检查是否已在 24 小时内推送过相同标题事件
+    norm_title = re.sub(r"[^a-z0-9]+", "", ev["title"].lower())
+    if processed_titles is not None and norm_title and norm_title in processed_titles:
+        print(f"[INFO] Skipped duplicate story by title for {stock['ticker']}: {ev['title']}")
+        processed_ids.add(ev["id"])
+        return
 
     facts = gemini_translate_facts(ev, api_key)
     if not facts.get("is_relevant", True):
@@ -1430,13 +1462,6 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
 
     pub_time_str = format_pub_time(ev.get("published_at"))
     time_label = ev.get("time_label", "原始发布时间")
-
-    # 标题防重复：检查是否已在 24 小时内推送过相同事件
-    norm_title = re.sub(r"[^a-z0-9]+", "", ev["title"].lower())
-    if processed_titles and norm_title in processed_titles:
-        print(f"[INFO] Skipped duplicate story by title for {stock['ticker']}: {ev['title']}")
-        processed_ids.add(ev["id"])
-        return
 
     # 智能识别纯日程/电话会预告（避免对没有业绩数据的预告强行深度分析）
     is_schedule_notice = bool(
@@ -1471,7 +1496,7 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
             deep_model_label = used_m
             vault_badge = " + 投研库内外口径比对" if stock_vault_notes else ""
 
-    # 构建统一单条推送（杜绝连发两条微信骚扰，绝不发送第二条“深度解读暂不可用”的空壳消息！）
+    # 构建统一单条推送（深色/浅色模式 100% 自适应高对比度排版，绝不硬编码黑底黑字或白底白字）
     has_deep = bool(deep_text)
     badge = f"【{'官方' if is_official else '第三方'}{'·深度' if has_deep else ''}】"
     push_title = f"{badge}{stock['ticker']} | {title_cn}"
@@ -1479,11 +1504,11 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
     deep_card_html = ""
     if has_deep:
         deep_card_html = f"""
-        <div style="background:#fef7e0;border-left:4px solid #fbbc04;padding:12px 14px;margin:12px 0;border-radius:4px;">
-          <div style="font-weight:bold;color:#b06000;font-size:13px;margin-bottom:6px;">
+        <div style="background:rgba(128,128,128,0.12);border-left:4px solid #f59e0b;padding:12px 14px;margin:12px 0;border-radius:4px;">
+          <div style="font-weight:bold;font-size:13.5px;margin-bottom:6px;">
             💡 Gemini 深度投研解读 ({deep_model_label} + ClinicalTrials{vault_badge})
           </div>
-          <div style="font-size:13.5px;line-height:1.65;color:#202124;">
+          <div style="font-size:13.5px;line-height:1.68;">
             {format_body_for_wechat_html(deep_text)}
           </div>
         </div>
@@ -1492,31 +1517,31 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
     notice_tip = ""
     if is_schedule_notice:
         notice_tip = """
-        <div style="background:#e8f0fe;border-left:4px solid #1a73e8;padding:8px 12px;margin:10px 0;border-radius:4px;font-size:13px;color:#174ea6;">
+        <div style="background:rgba(128,128,128,0.12);border-left:4px solid #3b82f6;padding:8px 12px;margin:10px 0;border-radius:4px;font-size:13px;">
           📌 <b>【事项预告提示】</b>：本通告为公司例行公布的财报/电话会日程预告，尚未披露具体经营业绩与财务数据。完整财务报告将在预告时间正式公布。
         </div>
         """
 
     unified_html = f"""
-    <div style="font-family:sans-serif;line-height:1.68;font-size:14px;color:#202124;">
-      <p style="margin:0 0 6px 0;font-size:13px;color:#555;">
+    <div style="font-family:sans-serif;line-height:1.68;font-size:14px;">
+      <p style="margin:0 0 6px 0;font-size:13px;opacity:0.85;">
         <b>{stock['ticker']}</b> ({stock['company']}) ｜ {category} ｜ <b>影响评分：{score}/10</b><br/>
         🕒 {html.escape(time_label)}：{html.escape(pub_time_str)}<br/>
         📡 信源：{html.escape(ev['source'])}
       </p>
-      <div style="margin:8px 0;line-height:1.45;">
-        <span style="color:#666;font-size:12px;">【原标题】</span> <span style="font-size:12.5px;color:#444;">{html.escape(ev['title'])}</span><br/>
-        <span style="color:#1a73e8;font-weight:bold;font-size:15px;">{html.escape(title_cn)}</span>
+      <div style="margin:8px 0;line-height:1.5;">
+        <div style="font-size:12.5px;opacity:0.78;">【原标题】{html.escape(ev['title'])}</div>
+        <div style="font-weight:bold;font-size:15.5px;margin-top:4px;">{html.escape(title_cn)}</div>
       </div>
       {notice_tip}
       {deep_card_html}
-      <hr style="border:none;border-top:1px solid #ddd;margin:10px 0;"/>
-      <div style="margin:8px 0;font-size:14px;line-height:1.7;">
-        <div style="font-weight:bold;color:#188038;margin-bottom:6px;font-size:13px;">📄 事实全文直译与临床数据：</div>
+      <hr style="border:none;border-top:1px solid rgba(128,128,128,0.3);margin:10px 0;"/>
+      <div style="margin:8px 0;font-size:14px;line-height:1.72;">
+        <div style="font-weight:bold;margin-bottom:6px;font-size:13.5px;">📄 事实全文直译与临床数据：</div>
         {format_body_for_wechat_html(body_cn)}
       </div>
-      <hr style="border:none;border-top:1px solid #ddd;margin:10px 0;"/>
-      <p style="margin:4px 0;font-size:12.5px;color:#666;">
+      <hr style="border:none;border-top:1px solid rgba(128,128,128,0.3);margin:10px 0;"/>
+      <p style="margin:4px 0;font-size:12.5px;opacity:0.85;">
         <a href="{ev['url']}">🔗 查看英文原稿</a> ｜ <a href="https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit">📊 打开云端历史归档 (Logs)</a>
       </p>
     </div>
@@ -1545,6 +1570,8 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
         ],
     )
     processed_ids.add(ev["id"])
+    if processed_titles is not None and norm_title:
+        processed_titles.add(norm_title)
 
 
 def main(duration_minutes=0):
@@ -1578,13 +1605,7 @@ def main(duration_minutes=0):
         while time.time() < end_time:
             now_t = time.time()
 
-            # 1. 高频 Gmail 检查 (每 10~15 秒轮询一次，秒级捕获 IR 邮件与媒体快讯)
-            gmail_ev = fetch_gmail_imap_events(config, portfolio, processed_ids, max_age_hours=24)
-            for ev in gmail_ev:
-                if ev["id"] not in processed_ids:
-                    process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
-
-            # 2. 定时 SEC EDGAR & Yahoo Finance RSS 检查 (每 60 秒轮询一次)
+            # 1. 优先检查 SEC EDGAR & Yahoo Finance RSS 一手完整官方新闻稿 (每 60 秒轮询一次)
             if now_t - last_rss_sec_check >= 60:
                 last_rss_sec_check = now_t
                 for stock in portfolio:
@@ -1599,6 +1620,12 @@ def main(duration_minutes=0):
                     for ev in yf_ev:
                         if ev["id"] not in processed_ids:
                             process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
+
+            # 2. 高频 Gmail 检查 (每 10~15 秒轮询一次，秒级捕获 IR 邮件与媒体快讯)
+            gmail_ev = fetch_gmail_imap_events(config, portfolio, processed_ids, max_age_hours=24)
+            for ev in gmail_ev:
+                if ev["id"] not in processed_ids:
+                    process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
 
             time.sleep(10)
         print(f"[INFO] Continuous Monitor Loop completed cleanly after {duration_minutes} minutes.")

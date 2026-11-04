@@ -54,12 +54,18 @@ const VAULT_SYNC_FOLDER_ID = "1x-3gF5g8ceE3Z8oulNKBuMEyNHfGxAtF";
 
 // 官方 IR 邮箱与域名清单
 const OFFICIAL_IR_DOMAINS = [
+  "gcs-web.com",
   "alert.gcs-web.com",
+  "notification.gcs-web.com",
   "notified.com",
   "q4inc.com",
   "equisolve.com",
   "issuerdirect.com",
-  "sec.gov"
+  "sec.gov",
+  "krystalbio.com",
+  "arrowheadpharma.com",
+  "absci.com",
+  "veradermics.com"
 ];
 
 // 专业生科媒体清单
@@ -194,8 +200,8 @@ function runGmailScan(sheet, config, portfolio, startTime) {
       const isOfficial = OFFICIAL_IR_DOMAINS.some(d => senderLower.includes(d));
 
       let articleUrl = "https://mail.google.com/mail/u/0/#inbox";
-      // 官方 IR 邮件若内容过短，安全尝试抓取原新闻稿，单次最多耗时 5 秒
-      if (isOfficial && cleanedBody.length < 250 && bodyHtml) {
+      // 官方 IR 邮件若内容过短或无实质正文，安全尝试抓取原新闻稿，单次最多耗时 5 秒
+      if (isOfficial && (cleanedBody.length < 450 || !hasSubstantiveBody(subject, cleanedBody)) && bodyHtml) {
         const linkMatch = bodyHtml.match(/href=["'](https?:\/\/[^"']+)["']/i);
         if (linkMatch && !linkMatch[1].includes("unsubscribe") && !linkMatch[1].includes("google.com")) {
           articleUrl = linkMatch[1];
@@ -231,7 +237,8 @@ function runGmailScan(sheet, config, portfolio, startTime) {
         }
 
         const hasSubstantive = hasSubstantiveBody(subject, cleanedBody);
-        if (cleanedBody.trim().length < 20 && !hasSubstantive) {
+        const isIrLinkStub = /view this release|view all releases|powered by notified|查看本新闻稿|查看所有新闻稿/i.test(cleanedBody);
+        if (!hasSubstantive && (isOfficial || isIrLinkStub || cleanedBody.trim().length < 20)) {
           msg.markRead();
           continue;
         }
@@ -256,7 +263,7 @@ function runGmailScan(sheet, config, portfolio, startTime) {
             }
           }
 
-          // 严格单条合并推送
+          // 严格单条合并推送（深色/浅色模式 100% 自适应高对比度排版，绝不硬编码黑底黑字或白底白字）
           const hasDeep = Boolean(deepText);
           const badge = `【${isOfficial ? "官方" : "第三方"}${hasDeep ? "·深度" : ""}】`;
           const singleTitle = `${badge}${matchedStock.ticker} | ${titleCn}`;
@@ -265,11 +272,11 @@ function runGmailScan(sheet, config, portfolio, startTime) {
           let deepCardHtml = "";
           if (hasDeep) {
             deepCardHtml = `
-              <div style="background:#fef7e0;border-left:4px solid #fbbc04;padding:12px 14px;margin:12px 0;border-radius:4px;">
-                <div style="font-weight:bold;color:#b06000;font-size:13px;margin-bottom:6px;">
+              <div style="background:rgba(128,128,128,0.12);border-left:4px solid #f59e0b;padding:12px 14px;margin:12px 0;border-radius:4px;">
+                <div style="font-weight:bold;font-size:13.5px;margin-bottom:6px;">
                   💡 Gemini 深度投研解读
                 </div>
-                <div style="font-size:13.5px;line-height:1.65;color:#202124;">
+                <div style="font-size:13.5px;line-height:1.68;">
                   ${formatBodyHtml(deepText)}
                 </div>
               </div>
@@ -279,32 +286,32 @@ function runGmailScan(sheet, config, portfolio, startTime) {
           let noticeTip = "";
           if (isScheduleNotice) {
             noticeTip = `
-              <div style="background:#e8f0fe;border-left:4px solid #1a73e8;padding:8px 12px;margin:10px 0;border-radius:4px;font-size:13px;color:#174ea6;">
+              <div style="background:rgba(128,128,128,0.12);border-left:4px solid #3b82f6;padding:8px 12px;margin:10px 0;border-radius:4px;font-size:13px;">
                 📌 <b>【事项预告提示】</b>：本通告为公司例行公布的财报/电话会日程预告，尚未披露具体经营业绩与财务数据。完整财务报告将在预告时间正式公布。
               </div>
             `;
           }
 
           const unifiedHtml = `
-            <div style="font-family:sans-serif;line-height:1.68;font-size:14px;color:#202124;">
-              <p style="margin:0 0 6px 0;font-size:13px;color:#555;">
+            <div style="font-family:sans-serif;line-height:1.68;font-size:14px;">
+              <p style="margin:0 0 6px 0;font-size:13px;opacity:0.85;">
                 <b>${matchedStock.ticker}</b> (${matchedStock.company}) ｜ ${facts.category} ｜ <b>影响评分：${score}/10</b><br/>
                 🕒 原始发送时间：${pubTimeStr}<br/>
                 📡 信源：${escapeHtml(isOfficial ? "公司官方 IR 邮件订阅" : "第三方媒体快讯: " + sender.substring(0, 35))}
               </p>
-              <div style="margin:8px 0;line-height:1.45;">
-                <span style="color:#666;font-size:12px;">【原标题】</span> <span style="font-size:12.5px;color:#444;">${escapeHtml(subject)}</span><br/>
-                <span style="color:#1a73e8;font-weight:bold;font-size:15px;">${escapeHtml(titleCn)}</span>
+              <div style="margin:8px 0;line-height:1.5;">
+                <div style="font-size:12.5px;opacity:0.78;">【原标题】${escapeHtml(subject)}</div>
+                <div style="font-weight:bold;font-size:15.5px;margin-top:4px;">${escapeHtml(titleCn)}</div>
               </div>
               ${noticeTip}
               ${deepCardHtml}
-              <hr style="border:none;border-top:1px solid #ddd;margin:10px 0;"/>
-              <div style="margin:8px 0;font-size:14px;line-height:1.7;">
-                <div style="font-weight:bold;color:#188038;margin-bottom:6px;font-size:13px;">📄 事实全文直译与临床数据：</div>
+              <hr style="border:none;border-top:1px solid rgba(128,128,128,0.3);margin:10px 0;"/>
+              <div style="margin:8px 0;font-size:14px;line-height:1.72;">
+                <div style="font-weight:bold;margin-bottom:6px;font-size:13.5px;">📄 事实全文直译与临床数据：</div>
                 ${formatBodyHtml(bodyCn)}
               </div>
-              <hr style="border:none;border-top:1px solid #ddd;margin:10px 0;"/>
-              <p style="margin:4px 0;font-size:12.5px;color:#666;"><a href="${articleUrl}">🔗 查看原邮件或通告链接</a></p>
+              <hr style="border:none;border-top:1px solid rgba(128,128,128,0.3);margin:10px 0;"/>
+              <p style="margin:4px 0;font-size:12.5px;opacity:0.85;"><a href="${articleUrl}">🔗 查看原邮件或通告链接</a></p>
             </div>
           `;
           sendPushPlus(pushToken, singleTitle, unifiedHtml);
@@ -334,15 +341,15 @@ function runGmailScan(sheet, config, portfolio, startTime) {
             const pubTimeStr = formatDateTime(date);
             const digestHtml = `
               <div style="font-family:sans-serif;line-height:1.68;font-size:14px;">
-                <p style="margin:0 0 6px 0;font-size:13px;">
+                <p style="margin:0 0 6px 0;font-size:13px;opacity:0.85;">
                   <b>${escapeHtml(digest.mediaName)}</b> ｜ 生科行业要闻速览<br/>
                   🕒 ${pubTimeStr}<br/>
                   📡 信源：${escapeHtml(sender.substring(0, 45))}
                 </p>
-                <hr style="border:none;border-top:1px solid #555;margin:8px 0;"/>
-                <div style="margin:8px 0;font-size:14px;white-space:pre-wrap;">${formatBodyHtml(digest.digestText)}</div>
-                <hr style="border:none;border-top:1px solid #555;margin:8px 0;"/>
-                <p style="margin:4px 0;font-size:13px;"><a href="https://mail.google.com/mail/u/0/#inbox">🔗 查看原始邮件</a></p>
+                <hr style="border:none;border-top:1px solid rgba(128,128,128,0.3);margin:8px 0;"/>
+                <div style="margin:8px 0;font-size:14px;">${formatBodyHtml(digest.digestText)}</div>
+                <hr style="border:none;border-top:1px solid rgba(128,128,128,0.3);margin:8px 0;"/>
+                <p style="margin:4px 0;font-size:13px;opacity:0.85;"><a href="https://mail.google.com/mail/u/0/#inbox">🔗 查看原始邮件</a></p>
               </div>
             `;
             sendPushPlus(pushToken, pushTitle, digestHtml);
@@ -539,44 +546,45 @@ function processSingleVaultFile(sheet, vaultTab, config, ticker, stockCfg, roleL
   ]);
   Logger.log(`[VAULT] Successfully recorded row in Vault sheet: ${vId}`);
 
-  // 发送 PushPlus 微信通知（统一单条、图文排版、带金色预期卡片与一键查阅中英对照 PDF 按钮）
+  // 发送 PushPlus 微信通知（深色/浅色模式自适应排版，带核心预期卡片与一键查阅中英对照 PDF 链接）
   const pushTitle = `【投研库入库】${ticker} ｜ ${chineseTitle}`;
   const pushHtml = `
-    <div style="font-family:sans-serif;line-height:1.68;font-size:14px;color:#202124;">
-      <p style="margin:0 0 6px 0;font-size:13px;color:#555;">
+    <div style="font-family:sans-serif;line-height:1.68;font-size:14px;">
+      <p style="margin:0 0 6px 0;font-size:13px;opacity:0.85;">
         <b>${ticker}</b> (${stockCfg.name}) ｜ <b>${roleLabel}</b><br/>
         🕒 入库时间：${bjTimeStr}<br/>
         📁 原始文件：${escapeHtml(fileName)}
       </p>
-      <div style="margin:8px 0;line-height:1.45;">
-        <span style="color:#1a73e8;font-weight:bold;font-size:16px;">${escapeHtml(chineseTitle)}</span>
+      <div style="margin:8px 0;line-height:1.5;font-weight:bold;font-size:16px;">
+        ${escapeHtml(chineseTitle)}
       </div>
       
-      <!-- 金色核心预期共识卡片 -->
-      <div style="background:#fef7e0;border-left:4px solid #fbbc04;padding:12px 14px;margin:12px 0;border-radius:4px;">
-        <div style="font-weight:bold;color:#b06000;font-size:13.5px;margin-bottom:6px;">
+      <!-- 核心预期共识卡片 -->
+      <div style="background:rgba(128,128,128,0.12);border-left:4px solid #f59e0b;padding:12px 14px;margin:12px 0;border-radius:4px;">
+        <div style="font-weight:bold;font-size:13.5px;margin-bottom:6px;">
           🎯 华尔街核心观点与预期共识基准 (Consensus Bar)
         </div>
-        <div style="font-size:13.5px;line-height:1.65;color:#202124;">
+        <div style="font-size:13.5px;line-height:1.68;">
           ${formatBodyHtml(coreBenchmark)}
         </div>
       </div>
 
-      <!-- 蓝底中英对照高清 PDF 直达卡片 -->
-      <div style="background:#e8f0fe;border-left:4px solid #1a73e8;padding:12px 14px;margin:12px 0;border-radius:4px;">
-        <div style="font-weight:bold;color:#174ea6;font-size:13.5px;margin-bottom:6px;">
+      <!-- 中英对照高清 PDF 直达卡片 -->
+      <div style="background:rgba(128,128,128,0.12);border-left:4px solid #3b82f6;padding:12px 14px;margin:12px 0;border-radius:4px;">
+        <div style="font-weight:bold;font-size:13.5px;margin-bottom:6px;">
           📄 中英对照高清 PDF 已自动生成并存入投研库
         </div>
-        <div style="font-size:13px;color:#333;margin-bottom:8px;">
-          已根据原始研报/会议纪要完成逐章节中英对照精排，支持在电脑或手机端直接查阅高清版。
+        <div style="font-size:13px;opacity:0.88;margin-bottom:8px;">
+          已根据原始研报/会议纪要完成左右双栏中英对照精排，支持在电脑或手机端直接查阅高清版。
         </div>
         <div>
-          <a href="${pdfUrl}" target="_blank" style="display:inline-block;background:#1a73e8;color:#ffffff;padding:8px 16px;border-radius:4px;text-decoration:none;font-size:13.5px;font-weight:bold;">👉 点击在线查阅中英对照完整 PDF</a>
-          <a href="${file.getUrl()}" target="_blank" style="margin-left:12px;color:#5f6368;font-size:12.5px;text-decoration:underline;">查看英文原件</a>
+          <a href="${pdfUrl}" target="_blank" style="font-size:14px;font-weight:bold;text-decoration:underline;">👉 点击在线查阅中英对照完整 PDF</a>
+          <span style="margin:0 8px;opacity:0.5;">｜</span>
+          <a href="${file.getUrl()}" target="_blank" style="font-size:13px;opacity:0.85;text-decoration:underline;">查看英文原件</a>
         </div>
       </div>
-      <hr style="border:none;border-top:1px solid #ddd;margin:10px 0;"/>
-      <p style="margin:4px 0;font-size:12px;color:#888;">美股生物医药投研库 (Biotech Research Vault) 24x7 自动化云端管家</p>
+      <hr style="border:none;border-top:1px solid rgba(128,128,128,0.3);margin:10px 0;"/>
+      <p style="margin:4px 0;font-size:12px;opacity:0.75;">美股生物医药投研库 (Biotech Research Vault) 24x7 自动化云端管家</p>
     </div>
   `;
 
@@ -628,18 +636,18 @@ ${textContent}
 
   const pushTitle = `【底稿同步】${ticker} ｜ ${title}`;
   const pushHtml = `
-    <div style="font-family:sans-serif;line-height:1.68;font-size:14px;color:#202124;">
-      <p style="margin:0 0 6px 0;font-size:13px;color:#555;">
+    <div style="font-family:sans-serif;line-height:1.68;font-size:14px;">
+      <p style="margin:0 0 6px 0;font-size:13px;opacity:0.85;">
         <b>${ticker}</b> ｜ <b>网站与催化剂底稿同步</b><br/>
         🕒 入库时间：${bjTimeStr}<br/>
         📁 原始底稿：${escapeHtml(fileName)}
       </p>
-      <div style="margin:8px 0;font-size:15px;color:#1a73e8;font-weight:bold;">${escapeHtml(title)}</div>
-      <div style="background:#fef7e0;border-left:4px solid #fbbc04;padding:12px 14px;margin:10px 0;border-radius:4px;font-size:13.5px;">
+      <div style="margin:8px 0;font-size:15.5px;font-weight:bold;">${escapeHtml(title)}</div>
+      <div style="background:rgba(128,128,128,0.12);border-left:4px solid #f59e0b;padding:12px 14px;margin:10px 0;border-radius:4px;font-size:13.5px;">
         <b>🎯 底稿核心观点：</b><br/>${formatBodyHtml(summary)}
       </div>
-      <div>
-        <a href="${pdfUrl}" target="_blank" style="display:inline-block;background:#1a73e8;color:#ffffff;padding:8px 16px;border-radius:4px;text-decoration:none;font-size:13px;font-weight:bold;">👉 查阅排版 PDF</a>
+      <div style="margin-top:8px;">
+        <a href="${pdfUrl}" target="_blank" style="font-size:14px;font-weight:bold;text-decoration:underline;">👉 查阅排版 PDF</a>
       </div>
     </div>
   `;
@@ -858,7 +866,9 @@ function hasSubstantiveBody(title, body) {
   if (!body) return false;
   let b = body.trim();
   if (title) b = b.replace(new RegExp(title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "");
-  return b.length >= 160;
+  b = b.replace(/https?:\/\/\S+/g, "");
+  b = b.replace(/\b(read now|full article|click here to view all releases|click here|view this release|view all releases|powered by notified|view presentation|slideshow|transcript)\b/gi, "").trim();
+  return b.length >= 180;
 }
 
 function isStrictMatch(textUpper, stock) {
@@ -1098,11 +1108,23 @@ function sendPushPlus(token, title, htmlContent) {
 
 function formatBodyHtml(text) {
   if (!text) return "";
-  let s = escapeHtml(text);
-  s = s.replace(/•\s*\*\*(.*?)\*\*/g, '• <b style="color:#ffffff;">$1</b>');
-  s = s.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
-  s = s.replace(/\n/g, "<br/>\n");
-  return s;
+  const norm = String(text).replace(/([^\n])\s+•\s+/g, "$1\n• ");
+  const lines = norm.split(/\r?\n/);
+  const parts = [];
+  for (let i = 0; i < lines.length; i++) {
+    const s = lines[i].trim();
+    if (!s) continue;
+    if (/^【(核心要点|新闻稿完整正文).*】$/.test(s)) continue;
+    if (s.startsWith("#")) {
+      const hClean = escapeHtml(s.replace(/^#+\s*/, "")).replace(/\*\*(.*?)\*\*/g, "<b>$1</b>");
+      parts.push(`<div style="font-weight:bold;margin:10px 0 4px 0;">${hClean}</div>`);
+      continue;
+    }
+    let esc = escapeHtml(s);
+    esc = esc.replace(/\*\*(.*?)\*\*/g, "<b>$1</b>");
+    parts.push(`<div style="margin:6px 0;">${esc}</div>`);
+  }
+  return parts.join("\n");
 }
 
 function formatDateTime(d) {
