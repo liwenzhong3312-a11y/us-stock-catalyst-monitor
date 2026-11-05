@@ -800,6 +800,27 @@ def fetch_biocentury_rss_events(portfolio, processed_ids, max_age_hours=28):
             "home_url": "https://www.clinicaltrialsarena.com/",
             "fetch_full": True,
         },
+        {
+            "prefix": "BPD",
+            "name": "BioPharma Dive",
+            "rss_url": "https://www.biopharmadive.com/feeds/news/",
+            "home_url": "https://www.biopharmadive.com/",
+            "fetch_full": False,
+        },
+        {
+            "prefix": "FDA",
+            "name": "FDA Newsroom",
+            "rss_url": "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-releases/rss.xml",
+            "home_url": "https://www.fda.gov/news-events/fda-newsroom/press-announcements",
+            "fetch_full": True,
+        },
+        {
+            "prefix": "MCN",
+            "name": "MedCity News",
+            "rss_url": "https://medcitynews.com/feed/",
+            "home_url": "https://medcitynews.com/",
+            "fetch_full": True,
+        },
     ]
 
     now_utc = datetime.datetime.now(datetime.timezone.utc)
