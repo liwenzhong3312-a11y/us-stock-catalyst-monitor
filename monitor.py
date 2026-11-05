@@ -778,105 +778,130 @@ def fetch_yahoo_direct_news(stock, max_age_hours=24):
 
 def fetch_biocentury_rss_events(portfolio, processed_ids, max_age_hours=28):
     """
-    直接主动抓取 BioCentury 官方 XML 订阅源 (https://www.biocentury.com/rss/BioCentury.xml)：
-    1. 若单篇文章命中持仓标的（代码/公司名/管线药名），实时生成个股催化剂事件；
-    2. 每日汇总过去 24~28 小时内的 BioCentury 行业深度报道（FDA审批、M&A并购、GLP-1等赛道格局、宏观政策），自动生成 1 期【行业速览】BioCentury。
+    直接主动抓取免邮箱订阅的权威生科官方 XML 订阅源：
+    - BioCentury (https://www.biocentury.com/rss/BioCentury.xml)
+    - Clinical Trials Arena (https://www.clinicaltrialsarena.com/feed/，完美绕过其官网的企业邮箱注册限制)
+    1. 若单篇文章命中持仓标的（代码/公司名/管线药名），实时抓全文生成个股催化剂事件；
+    2. 每日汇总过去 24~28 小时内的行业深度报道，各自自动生成 1 期全量【行业速览】。
     """
     events = []
-    rss_url = "https://www.biocentury.com/rss/BioCentury.xml"
-    try:
-        req = urllib.request.Request(
-            rss_url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            xml_bytes = resp.read()
-        root = ET.fromstring(xml_bytes)
-        channel = root.find("channel")
-        if channel is None:
-            return events
+    direct_feeds = [
+        {
+            "prefix": "BC",
+            "name": "BioCentury",
+            "rss_url": "https://www.biocentury.com/rss/BioCentury.xml",
+            "home_url": "https://www.biocentury.com/rss",
+            "fetch_full": False,
+        },
+        {
+            "prefix": "CTA",
+            "name": "Clinical Trials Arena",
+            "rss_url": "https://www.clinicaltrialsarena.com/feed/",
+            "home_url": "https://www.clinicaltrialsarena.com/",
+            "fetch_full": True,
+        },
+    ]
 
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        bj_now = now_utc + datetime.timedelta(hours=8)
-        digest_lines = []
-        digest_html_links = []
-        latest_dt = None
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    bj_now = now_utc + datetime.timedelta(hours=8)
 
-        for item in channel.findall("item")[:25]:
-            title = (item.findtext("title") or "").strip()
-            link = (item.findtext("link") or "").strip()
-            guid = (item.findtext("guid") or link or title).strip()
-            pub_date = (item.findtext("pubDate") or "").strip()
-            desc = clean_boilerplate_text(html_to_text(item.findtext("description") or ""))
-
-            dt = None
-            if pub_date:
-                try:
-                    dt = parsedate_to_datetime(pub_date)
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=datetime.timezone.utc)
-                    if (now_utc - dt).total_seconds() / 3600.0 > max_age_hours:
-                        continue
-                except Exception:
-                    pass
-
-            if dt and (latest_dt is None or dt > latest_dt):
-                latest_dt = dt
-
-            combined = f"{title}\n{desc}"
-            matched_stock = None
-            for stock in portfolio:
-                if is_strict_match_for_stock(combined, stock):
-                    matched_stock = stock
-                    break
-
-            if matched_stock:
-                short_hash = hashlib.sha1(guid.encode("utf-8")).hexdigest()[:16]
-                ev_id = f"BC_{matched_stock['ticker']}_{short_hash}"
-                if ev_id not in processed_ids:
-                    events.append(
-                        {
-                            "id": ev_id,
-                            "event_type": "ticker_catalyst",
-                            "is_official": False,
-                            "has_substantive_body": len(desc) >= 120,
-                            "stock": matched_stock,
-                            "source": "生科权威智库：BioCentury RSS",
-                            "source_tier": "外部生科专业媒体",
-                            "published_at": dt or now_utc,
-                            "time_label": "原始发布时间",
-                            "title": title,
-                            "body_en": f"{title}\n\n{desc}",
-                            "url": link,
-                        }
-                    )
-            else:
-                digest_lines.append(f"• Title: {title}\n  Summary: {desc}\n  URL: {link}")
-                if link:
-                    digest_html_links.append(f'<a href="{link}">{html.escape(title)}</a>')
-
-        # 每日汇总推送 1 次 BioCentury 行业速览（北京时间 08:00 后且当日未推送过、至少有 3 条新资讯）
-        digest_id = f"BC_DIGEST_{bj_now.strftime('%Y%m%d')}"
-        if bj_now.hour >= 8 and len(digest_lines) >= 3 and digest_id not in processed_ids:
-            events.append(
-                {
-                    "id": digest_id,
-                    "event_type": "industry_digest",
-                    "is_official": False,
-                    "has_substantive_body": True,
-                    "stock": None,
-                    "source": "生科行业媒体：BioCentury Official RSS",
-                    "source_tier": "行业媒体周刊/快讯",
-                    "published_at": latest_dt or now_utc,
-                    "time_label": "原始发布时间",
-                    "title": f"BioCentury Daily Intelligence ({bj_now.strftime('%Y-%m-%d')})",
-                    "body_en": "\n\n".join(digest_lines)[:28000],
-                    "url": "https://www.biocentury.com/rss",
-                    "raw_html": "\n".join(digest_html_links),
-                }
+    for feed in direct_feeds:
+        try:
+            req = urllib.request.Request(
+                feed["rss_url"],
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
             )
-    except Exception as e:
-        print(f"[WARN] BioCentury RSS check failed: {e}")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                xml_bytes = resp.read()
+            root = ET.fromstring(xml_bytes)
+            channel = root.find("channel")
+            if channel is None:
+                continue
+
+            digest_lines = []
+            digest_html_links = []
+            latest_dt = None
+
+            for item in channel.findall("item")[:25]:
+                title = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or "").strip()
+                guid = (item.findtext("guid") or link or title).strip()
+                pub_date = (item.findtext("pubDate") or "").strip()
+                desc = clean_boilerplate_text(html_to_text(item.findtext("description") or ""))
+
+                dt = None
+                if pub_date:
+                    try:
+                        dt = parsedate_to_datetime(pub_date)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=datetime.timezone.utc)
+                        if (now_utc - dt).total_seconds() / 3600.0 > max_age_hours:
+                            continue
+                    except Exception:
+                        pass
+
+                if dt and (latest_dt is None or dt > latest_dt):
+                    latest_dt = dt
+
+                combined = f"{title}\n{desc}"
+                matched_stock = None
+                for stock in portfolio:
+                    if is_strict_match_for_stock(combined, stock):
+                        matched_stock = stock
+                        break
+
+                if matched_stock:
+                    short_hash = hashlib.sha1(guid.encode("utf-8")).hexdigest()[:16]
+                    ev_id = f"{feed['prefix']}_{matched_stock['ticker']}_{short_hash}"
+                    if ev_id not in processed_ids:
+                        body_en = f"{title}\n\n{desc}"
+                        if feed["fetch_full"] and link:
+                            full_txt = fetch_webpage_plain_text(link, is_sec=False, max_chars=25000)
+                            if len(full_txt) > len(body_en):
+                                body_en = full_txt
+                        events.append(
+                            {
+                                "id": ev_id,
+                                "event_type": "ticker_catalyst",
+                                "is_official": False,
+                                "has_substantive_body": len(body_en) >= 150,
+                                "stock": matched_stock,
+                                "source": f"生科权威媒体：{feed['name']} RSS",
+                                "source_tier": "外部生科专业媒体",
+                                "published_at": dt or now_utc,
+                                "time_label": "原始发布时间",
+                                "title": title,
+                                "body_en": body_en,
+                                "url": link,
+                            }
+                        )
+                else:
+                    digest_lines.append(f"• Title: {title}\n  Summary: {desc}\n  URL: {link}")
+                    if link:
+                        digest_html_links.append(f'<a href="{link}">{html.escape(title)}</a>')
+
+            # 每日汇总推送 1 次行业速览（北京时间 08:00 后且当日未推送过、至少有 3 条新资讯）
+            digest_id = f"{feed['prefix']}_DIGEST_{bj_now.strftime('%Y%m%d')}"
+            if bj_now.hour >= 8 and len(digest_lines) >= 3 and digest_id not in processed_ids:
+                events.append(
+                    {
+                        "id": digest_id,
+                        "event_type": "industry_digest",
+                        "is_official": False,
+                        "has_substantive_body": True,
+                        "stock": None,
+                        "source": f"生科行业媒体：{feed['name']} Official RSS",
+                        "source_tier": "行业媒体周刊/快讯",
+                        "published_at": latest_dt or now_utc,
+                        "time_label": "原始发布时间",
+                        "title": f"{feed['name']} Daily Intelligence ({bj_now.strftime('%Y-%m-%d')})",
+                        "body_en": "\n\n".join(digest_lines)[:28000],
+                        "url": feed["home_url"],
+                        "raw_html": "\n".join(digest_html_links),
+                    }
+                )
+        except Exception as e:
+            print(f"[WARN] {feed['name']} RSS check failed: {e}")
     return events
 
 
