@@ -16,9 +16,12 @@ const SPREADSHEET_ID = "1pIKfEy9UNPs32W5gBFJu3N5doqU-SKCvIBDjX-TMwGQ";
 
 // 可用的 Gemini 模型备选阵列（自动轮换，杜绝 404）
 const GEMINI_MODELS = [
+  "gemini-3.6-flash",
+  "gemini-3.5-flash",
+  "gemini-3.5-flash-lite",
+  "gemini-flash-lite-latest",
   "gemini-flash-latest",
   "gemini-3-flash-preview",
-  "gemini-3.1-flash-lite",
   "gemini-pro-latest"
 ];
 

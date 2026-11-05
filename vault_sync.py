@@ -32,8 +32,12 @@ SPREADSHEET_ID = os.environ.get(
 )
 
 VAULT_MODELS = [
-    "gemini-3-flash-preview",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-flash-lite-latest",
     "gemini-flash-latest",
+    "gemini-3-flash-preview",
     "gemini-pro-latest",
 ]
 
@@ -393,7 +397,7 @@ def call_gemini_with_rotation(
             gen_cfg = {"temperature": 0.15}
             if expect_json:
                 gen_cfg["responseMimeType"] = "application/json"
-            if deep_thinking:
+            if deep_thinking and ("gemini-3-flash" in model or "pro" in model):
                 gen_cfg["thinkingConfig"] = {"thinkingBudget": 4096}
 
             payload = {
@@ -401,7 +405,7 @@ def call_gemini_with_rotation(
                 "generationConfig": gen_cfg,
             }
             try:
-                resp = http_json(url, method="POST", payload=payload, timeout=120)
+                resp = http_json(url, method="POST", payload=payload, timeout=90)
                 _KEY_INDEX = (_KEY_INDEX + attempt + 1) % len(keys)
                 candidates = resp.get("candidates", [])
                 if candidates and "content" in candidates[0]:
@@ -415,8 +419,8 @@ def call_gemini_with_rotation(
                         return text, model
             except urllib.error.HTTPError as e:
                 print(f"[WARN] Gemini key#{attempt+1} model {model} HTTP {e.code}: {e}")
-                if e.code == 429:
-                    time.sleep(2)
+                if e.code in (429, 503):
+                    time.sleep(0.5)
                     continue
             except Exception as e:
                 print(f"[WARN] Gemini key#{attempt+1} model {model} error: {e}")
@@ -859,7 +863,7 @@ def _extract_page_translatable_blocks(page):
 
 
 def translate_pdf_preserve_layout_side_by_side(
-    api_keys, stock, role_type, file_name, raw_pdf_bytes
+    api_keys, stock, role_type, file_name, raw_pdf_bytes, deadline=None
 ):
     """
     原版排版 100% 保留的【左英文原版页面 + 右同版式中文原位替换页面】双拼 PDF 翻译引擎：
@@ -887,29 +891,58 @@ def translate_pdf_preserve_layout_side_by_side(
         )
         return None, summary, bilingual_md
 
+    # 按字符上限 (<= 10000 字符) 与块数上限 (<= 110 块) 智能动态分批，大幅减少 API 请求次数并加快长文档处理速度
+    batches = []
+    cur_batch = []
+    cur_chars = 0
+    for k, txt in payload_blocks:
+        item_len = len(txt) + 16
+        if cur_batch and (len(cur_batch) >= 110 or cur_chars + item_len > 10000):
+            batches.append(cur_batch)
+            cur_batch = []
+            cur_chars = 0
+        cur_batch.append((k, txt))
+        cur_chars += item_len
+    if cur_batch:
+        batches.append(cur_batch)
+
     trans_map = {}
-    BATCH_SIZE = 40
-    for i in range(0, len(payload_blocks), BATCH_SIZE):
-        batch = payload_blocks[i : i + BATCH_SIZE]
+    for b_idx, batch in enumerate(batches):
+        if deadline and time.time() > deadline:
+            raise TimeoutError(
+                f"Approaching job time limit on batch {b_idx+1}/{len(batches)} for {file_name}"
+            )
         input_str = "\n".join(f"<<<{k}>>>\n{txt}" for k, txt in batch)
         prompt = (
             f"你是一位华尔街顶级生物医药分析师与专业同声传译。当前正在原位翻译 {stock['ticker']} ({stock['company']}) 的【{role_type}】文献（{file_name}）。\n"
             "请将以下带有 <<<ID>>> 标记的 PDF 英文文本块逐一完整精准地翻译为简体中文。\n"
             "核心要求：\n"
-            "1. 必须保留原有的每个 <<<ID>>> 标记（格式严格为 <<<ID>>> 独占一行，紧跟对应的中文译文），严禁漏掉任何一个 ID！\n"
+            "1. 必须保留原有的每个 <<<ID>>> 标记（格式严格为 <<<ID>>> 独占一行，紧跟对应的中文译文），严禁漏掉任何一个 ID，严禁输出任何开场白或额外解释！\n"
             "2. 严禁浓缩、严禁删减任何句子或临床数据，保留所有临床试验名称、药物名称、靶点、数字、货币符号。\n"
             "3. 纯人名与邮箱地址保持英文原样，职位、部门、表头、图表标题、免责声明等全部译为简明精准的中文。\n\n"
             f"{input_str}"
         )
-        resp_text, _ = call_gemini_with_rotation(
+        resp_text, used_model = call_gemini_with_rotation(
             api_keys, prompt, expect_json=False, deep_thinking=False
         )
-        if resp_text:
-            matches = re.findall(
-                r"<<<(P\d+_\d+)>>>\s*([\s\S]*?)(?=(?:<<<P\d+_\d+>>>)|\Z)", resp_text
+        if not resp_text:
+            raise RuntimeError(
+                f"Gemini API returned empty response on batch {b_idx+1}/{len(batches)} for {file_name}; aborting to prevent untranslated PDF"
             )
-            for k, v in matches:
-                trans_map[k.strip()] = v.strip()
+        matches = re.findall(
+            r"<<<(P\d+_\d+)>>>\s*([\s\S]*?)(?=(?:<<<P\d+_\d+>>>)|\Z)", resp_text
+        )
+        for k, v in matches:
+            trans_map[k.strip()] = v.strip()
+        print(
+            f"[INFO] Translated batch {b_idx+1}/{len(batches)} ({len(matches)}/{len(batch)} blocks) via {used_model} for {file_name}"
+        )
+
+    min_required = max(1, int(len(payload_blocks) * 0.55))
+    if len(trans_map) < min_required:
+        raise RuntimeError(
+            f"Insufficient translated blocks ({len(trans_map)}/{len(payload_blocks)}) for {file_name}; aborting upload"
+        )
 
     for pno, items in all_page_items.items():
         page = trans_doc[pno]
@@ -1197,7 +1230,14 @@ def append_vault_sheet_row(access_token, row_values):
     )
 
 
-def sync_drive_vault(access_token, config, portfolio, send_pushplus_fn=None):
+def sync_drive_vault(
+    access_token,
+    config,
+    portfolio,
+    send_pushplus_fn=None,
+    deadline=None,
+    max_files_per_pass=1,
+):
     """
     巡检 Google Drive 投研库中的所有新文件：
     - 若发现新上传的英文 PDF / 文档 / Claude 网站底稿，自动执行中英对照翻译、生成 PDF 并写入 Vault 知识库
@@ -1216,7 +1256,9 @@ def sync_drive_vault(access_token, config, portfolio, send_pushplus_fn=None):
     sync_files = list_folder_files(access_token, vault_tree["sync_folder"]["id"])
     existing_sync_names = {f["name"] for f in sync_files}
     for fmeta in sync_files:
-        if processed_count >= 2:
+        if processed_count >= max_files_per_pass:
+            break
+        if deadline and time.time() > deadline:
             break
         if is_translated_or_temp_file(fmeta["name"]):
             continue
@@ -1308,7 +1350,9 @@ def sync_drive_vault(access_token, config, portfolio, send_pushplus_fn=None):
             files = list_folder_files(access_token, folder_id)
             existing_names = {f["name"] for f in files}
             for fmeta in files:
-                if processed_count >= 2:
+                if processed_count >= max_files_per_pass:
+                    break
+                if deadline and time.time() > deadline:
                     break
                 fname = fmeta["name"]
                 if is_translated_or_temp_file(fname):
@@ -1343,23 +1387,13 @@ def sync_drive_vault(access_token, config, portfolio, send_pushplus_fn=None):
                     if is_pdf:
                         raw_bytes = download_drive_file_bytes(access_token, fmeta)
                         dual_pdf_bytes, summary, bilingual_md = translate_pdf_preserve_layout_side_by_side(
-                            api_keys, stock, role_label, fname, raw_bytes
+                            api_keys, stock, role_label, fname, raw_bytes, deadline=deadline
                         )
                     elif is_office:
-                        try:
-                            pdf_bytes = convert_office_file_to_pdf_bytes(access_token, fmeta)
-                            dual_pdf_bytes, summary, bilingual_md = translate_pdf_preserve_layout_side_by_side(
-                                api_keys, stock, role_label, fname, pdf_bytes
-                            )
-                        except Exception as conv_err:
-                            print(f"[WARN] Office-to-PDF conversion fallback for {fname}: {conv_err}")
-                            raw_bytes = download_drive_file_bytes(access_token, fmeta)
-                            text_content = extract_docx_text(raw_bytes) or raw_bytes.decode("utf-8", errors="replace")
-                            prompt = f"""请将以下 {ticker} ({stock['company']}) 的【{role_label}】文档（{fname}）逐段翻译为严格左右双栏中英对照格式（每段严格使用 [EN] 英文原文 与 [CN] 中文精译 标签成对输出），并在开头提炼 300 字以内的核心要点（区分内部承诺或外部投行预期阈值）：\n\n{text_content[:25000]}"""
-                            bilingual_md, _ = call_gemini_with_rotation(
-                                api_keys, prompt, expect_json=False, deep_thinking=True
-                            )
-                            summary = (bilingual_md or "")[:400]
+                        pdf_bytes = convert_office_file_to_pdf_bytes(access_token, fmeta)
+                        dual_pdf_bytes, summary, bilingual_md = translate_pdf_preserve_layout_side_by_side(
+                            api_keys, stock, role_label, fname, pdf_bytes, deadline=deadline
+                        )
                     else:
                         raw_bytes = download_drive_file_bytes(access_token, fmeta)
                         text_content = raw_bytes.decode("utf-8", errors="replace")

@@ -37,16 +37,22 @@ SPREADSHEET_ID = os.environ.get(
 SEC_USER_AGENT = "AntigravityBiotechMonitor/3.0 (neo664939@gmail.com)"
 
 GEMINI_TRIAGE_MODELS = [
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-flash-lite-latest",
     "gemini-flash-latest",
     "gemini-3-flash-preview",
-    "gemini-3.1-flash-lite",
 ]
 
 GEMINI_DEEP_MODELS = [
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-flash-lite-latest",
     "gemini-flash-latest",
     "gemini-3-flash-preview",
     "gemini-pro-latest",
-    "gemini-3.1-pro-preview",
 ]
 
 
@@ -1015,7 +1021,7 @@ def translate_title_fallback(title, api_key):
     if not title:
         return ""
     prompt = f"请将以下美股生物医药通告标题直译为一句精炼中文标题（不要多余解释，只输出中文标题）：\n{title}"
-    text, _ = call_gemini(api_key, prompt, expect_json=False, models=["gemini-3.1-flash-lite", "gemini-flash-latest"])
+    text, _ = call_gemini(api_key, prompt, expect_json=False, models=["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-flash-lite-latest"])
     if text:
         cleaned = re.sub(r"^[\*\"'“”‘’\s]+|[\*\"'“”‘’\s]+$", "", text.strip())
         if cleaned and re.search(r"[\u4e00-\u9fa5]", cleaned):
@@ -1309,7 +1315,7 @@ def send_pushplus(token, title, html_body):
     if not token or "请在此粘贴" in token:
         return
     try:
-        http_json(
+        res = http_json(
             "https://www.pushplus.plus/send",
             method="POST",
             payload={
@@ -1320,6 +1326,7 @@ def send_pushplus(token, title, html_body):
             },
             timeout=20,
         )
+        print(f"[INFO] PushPlus response for '{title[:32]}': code={res.get('code')} msg={res.get('msg')}")
     except Exception as e:
         print(f"[WARN] PushPlus send failed: {e}")
 
@@ -1621,16 +1628,11 @@ def main(duration_minutes=0):
 
     print(f"[INFO] Loaded {len(portfolio)} active targets from Google Sheet: {[s['ticker'] for s in portfolio]}")
 
-    # 读取 Google Sheet 的 Vault 投研知识库
+    # 启动时先毫秒级读取 Google Sheet 的 Vault 投研知识库，绝不在 SEC/新闻巡检前阻塞
     vault_knowledge = {}
     try:
-        from vault_sync import load_vault_sheet_records, sync_drive_vault
-        if os.environ.get("SYNC_DRIVE_VAULT", "0") == "1":
-            vault_knowledge = sync_drive_vault(
-                access_token, config, portfolio, send_pushplus_fn=send_pushplus
-            )
-        else:
-            _, vault_knowledge = load_vault_sheet_records(access_token)
+        from vault_sync import load_vault_sheet_records
+        _, vault_knowledge = load_vault_sheet_records(access_token)
     except Exception as e:
         print(f"[WARN] Vault records load skipped or failed: {e}")
 
@@ -1643,44 +1645,52 @@ def main(duration_minutes=0):
         end_time = loop_start + duration_minutes * 60 - 30  # 预留 30 秒安全退出
         last_rss_sec_check = 0
 
-        while time.time() < end_time:
-            now_t = time.time()
+        try:
+            while time.time() < end_time:
+                now_t = time.time()
 
-            # 1. 每 60 秒轮询一次：Google Drive 投研库新增文献自动翻译 + SEC EDGAR + Yahoo Finance RSS
-            if now_t - last_rss_sec_check >= 60:
-                last_rss_sec_check = now_t
-                if os.environ.get("SYNC_DRIVE_VAULT", "0") == "1":
-                    try:
-                        from vault_sync import sync_drive_vault
-                        vault_knowledge = sync_drive_vault(
-                            access_token, config, portfolio, send_pushplus_fn=send_pushplus
-                        )
-                    except Exception as ve:
-                        print(f"[WARN] Periodic vault sync check error: {ve}")
+                # 1. 每 60 秒轮询一次：优先执行 SEC EDGAR + Yahoo Finance RSS 实时监控，随后在剩余时间预算内推进 1 份投研库文献翻译
+                if now_t - last_rss_sec_check >= 60:
+                    last_rss_sec_check = now_t
 
-                for stock in portfolio:
-                    cik = cik_map.get(stock["ticker"])
-                    sec_ev = fetch_sec_edgar_events(stock, cik, max_age_hours=24)
-                    for ev in sec_ev:
+                    for stock in portfolio:
+                        cik = cik_map.get(stock["ticker"])
+                        sec_ev = fetch_sec_edgar_events(stock, cik, max_age_hours=36)
+                        for ev in sec_ev:
+                            if ev["id"] not in processed_ids:
+                                process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
+
+                    for stock in portfolio:
+                        yf_ev = fetch_yahoo_direct_news(stock, max_age_hours=36)
+                        for ev in yf_ev:
+                            if ev["id"] not in processed_ids:
+                                process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
+
+                    if os.environ.get("SYNC_DRIVE_VAULT", "0") == "1" and time.time() < end_time - 60:
+                        try:
+                            from vault_sync import sync_drive_vault
+                            vault_knowledge = sync_drive_vault(
+                                access_token,
+                                config,
+                                portfolio,
+                                send_pushplus_fn=send_pushplus,
+                                deadline=end_time - 25,
+                                max_files_per_pass=1,
+                            )
+                        except Exception as ve:
+                            print(f"[WARN] Periodic vault sync check error: {ve}")
+
+                # 2. Gmail 检查已交由 Google Apps Script (Tickermonitor) 原生接管；仅在显式开启 ENABLE_GMAIL_IMAP=1 时才由 Python 轮询
+                if os.environ.get("ENABLE_GMAIL_IMAP", "0") == "1":
+                    gmail_ev = fetch_gmail_imap_events(config, portfolio, processed_ids, max_age_hours=24)
+                    for ev in gmail_ev:
                         if ev["id"] not in processed_ids:
                             process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
 
-                for stock in portfolio:
-                    yf_ev = fetch_yahoo_direct_news(stock, max_age_hours=24)
-                    for ev in yf_ev:
-                        if ev["id"] not in processed_ids:
-                            process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
-
-            # 2. Gmail 检查已交由 Google Apps Script (Tickermonitor) 原生接管；仅在显式开启 ENABLE_GMAIL_IMAP=1 时才由 Python 轮询
-            if os.environ.get("ENABLE_GMAIL_IMAP", "0") == "1":
-                gmail_ev = fetch_gmail_imap_events(config, portfolio, processed_ids, max_age_hours=24)
-                for ev in gmail_ev:
-                    if ev["id"] not in processed_ids:
-                        process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
-
-            time.sleep(10)
-        print(f"[INFO] Continuous Monitor Loop completed cleanly after {duration_minutes} minutes.")
-        trigger_next_github_relay(config)
+                time.sleep(10)
+            print(f"[INFO] Continuous Monitor Loop completed cleanly after {duration_minutes} minutes.")
+        finally:
+            trigger_next_github_relay(config)
         return
 
     # 单次巡检模式 (duration_minutes == 0)
