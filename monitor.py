@@ -110,6 +110,17 @@ BIOTECH_MEDIA_DOMAINS = [
     "clinicaltrialsarena.com",
     "nature.com",
     "cell.com",
+    "biocentury.com",
+    "fda.gov",
+    "nih.gov",
+    "medscape.com",
+    "biorxiv.org",
+    "medrxiv.org",
+    "cbinsights.com",
+    "science.org",
+    "aaas.org",
+    "nejm.org",
+    "thelancet.com",
 ]
 
 # 非生科媒体/通用交易与系统通知发件人（过滤无关广告与通用资讯）
@@ -805,15 +816,19 @@ def fetch_gmail_imap_events(config, portfolio, processed_ids, max_age_hours=24):
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         msg_nums = data[0].split()[-25:]
         for num in reversed(msg_nums):
-            st, msg_data = mail.fetch(num, "(RFC822)")
+            st, msg_data = mail.fetch(num, "(X-GM-MSGID RFC822)")
             if st != "OK" or not msg_data or not msg_data[0]:
                 continue
+            hdr_meta = msg_data[0][0].decode("utf-8", errors="ignore") if isinstance(msg_data[0][0], bytes) else str(msg_data[0][0])
+            gm_m = re.search(r"X-GM-MSGID\s+(\d+)", hdr_meta)
+            gas_id = f"GAS_{hex(int(gm_m.group(1)))[2:]}" if gm_m else None
             raw_email = msg_data[0][1]
             msg = email.message_from_bytes(raw_email)
             msg_id_hdr = (msg.get("Message-ID") or str(num)).strip()
-            ev_id = "GMAIL_" + hashlib.sha1(msg_id_hdr.encode("utf-8")).hexdigest()[:16]
-            if ev_id in processed_ids:
+            gmail_id = "GMAIL_" + hashlib.sha1(msg_id_hdr.encode("utf-8")).hexdigest()[:16]
+            if gmail_id in processed_ids or (gas_id and gas_id in processed_ids):
                 continue
+            ev_id = gas_id or gmail_id
 
             subject = decode_mime_str(msg.get("Subject", "(无标题)")).strip()
             sender = decode_mime_str(msg.get("From", "")).strip()
@@ -830,8 +845,11 @@ def fetch_gmail_imap_events(config, portfolio, processed_ids, max_age_hours=24):
                 except Exception:
                     pass
 
-            # 跳过订阅确认信本身
+            # 跳过订阅确认信本身及纯会议售票促销邮件 (如 events@endpointsnews.com)
             if re.search(r"(?i)(confirm your subscription|verify your email|welcome to .* investor)", subject):
+                continue
+            if "events@endpointsnews.com" in sender.lower() or re.search(r"(?i)^\d+\s*(days?|hours?)\s+to\s+go\b", subject):
+                processed_ids.add(ev_id)
                 continue
 
             body_text = ""
@@ -925,13 +943,13 @@ def fetch_gmail_imap_events(config, portfolio, processed_ids, max_age_hours=24):
                         "published_at": msg_dt,
                         "time_label": "邮件发送时间",
                         "title": subject,
-                        "body_en": cleaned_body[:8000],
+                        "body_en": cleaned_body[:28000],
                         "url": article_url,
                         "raw_html": raw_html,
                     }
                 )
             else:
-                # 未匹配持仓个股：检查是否为专业生科媒体（BioSpace, Endpoints 等）的行业 Newsletter
+                # 未匹配持仓个股：检查是否为专业生科媒体（BioSpace, Endpoints, STAT, Nature 等）的行业 Newsletter
                 if is_biotech_media_sender(sender) and len(cleaned_body) >= 150:
                     events.append(
                         {
@@ -945,7 +963,7 @@ def fetch_gmail_imap_events(config, portfolio, processed_ids, max_age_hours=24):
                             "published_at": msg_dt,
                             "time_label": "邮件发送时间",
                             "title": subject,
-                            "body_en": cleaned_body[:8000],
+                            "body_en": cleaned_body[:28000],
                             "url": "https://mail.google.com/mail/u/0/#inbox",
                             "raw_html": raw_html,
                         }
@@ -1341,10 +1359,10 @@ def send_pushplus(token, title, html_body):
 
 def gemini_industry_digest(ev, api_key):
     """
-    对生物医药专业媒体（BioSpace, Endpoints, Fierce 等）综合 Newsletter 提炼行业速览：
-    1. 彻底过滤纯招聘、消费品或通用科技广告；
-    2. 精选 2~5 条最具行业影响力/商业临床价值的重大新闻；
-    3. 每条输出：【中文简明标题】+ 原标题 + 1句话核心事实（靶点/适应症/关键数据/金额）+ 原文链接。
+    对生物医药专业媒体（STAT, Endpoints, BioSpace, Fierce, Nature Briefing, BioCentury 等）综合 Newsletter 提炼全量高价值行业速览：
+    1. 彻底过滤纯招聘、会议买票促销或通用消费品广告；
+    2. 取消人为条数上限（应留尽留）：凡涉及个股药企动态/临床数据、M&A并购潜力/BD交易/投融资、宏观医药政策/FDA监管风向/药价医保博弈、以及前沿靶点突破，全部逐条完整保留（哪怕一封邮件有 8~16 条也全部列出，绝不遗漏任何对个股或医药板块有推动作用的资讯）；
+    3. 每条输出：【中文简明标题】+ (English Title) + 核心事实与催化逻辑（含公司/政策主体、靶点/适应症、关键数据/金额或板块影响）+ 原文链接。
     """
     links = []
     if ev.get("raw_html"):
@@ -1353,34 +1371,38 @@ def gemini_industry_digest(ev, api_key):
             if not any(x in l.lower() for x in ["unsubscribe", "privacy", "terms", "facebook", "twitter", "linkedin", "instagram", "youtube", "mailto:", "manage", "apple.com", "google.com"]):
                 if l not in links:
                     links.append(l)
-    links_str = "\n".join(links[:12])
+    links_str = "\n".join(links[:35])
 
-    prompt = f"""请阅读以下来自生物医药专业媒体的行业 Newsletter，为投资人提炼一份精炼、高价值的生科行业要闻速览。
+    prompt = f"""请阅读以下来自生物医药专业媒体的行业 Newsletter，为生物医药投资人提取一份**全面、无遗漏**的高价值生科行业与政策要闻速览。
 
 【邮件标题】：{ev['title']}
 【发件信源】：{ev['source']}
-【邮件正文文本】：
-{ev['body_en'][:7000]}
+【邮件正文完整文本】：
+{ev['body_en'][:28000]}
 
 【邮件附带的文章链接清单】：
 {links_str}
 
-⚠️ 提炼铁律：
-1. **彻底过滤非生科研发内容**：过滤掉求职招聘广告（如职位空缺、薪资报告）、求职指导、以及与医药研发无关的消费品或通用科技广告。
-2. **精炼 2~5 条最具行业影响力/商业临床价值的重大新闻**（重磅临床读出、FDA 审批与 CRL、重大授权许可/收购并购、前沿突破）。
-3. 每一条新闻严格采用以下纯文本格式：
+⚠️ 提炼铁律（核心原则：**应留尽留，严禁人为砍掉有价值的资讯，绝不限制在3条或5条**）：
+1. **四大必留核心维度（只要涉及以下任一维度，必须 100% 全部保留并逐条输出，哪怕一封邮件有 8～16 条也必须全部列出，绝不能漏掉）**：
+   - **① 个股与药企动态**：任何生物科技/制药公司的临床试验数据读出（无论成功或失败）、管线推进/终止、高管与战略变动、财务与商业化表现；
+   - **② 并购潜力与资本交易（M&A / BD / 融资）**：并购传闻、潜在被收购标的探讨、大药企 BD 授权合作（License-in/out）、资产剥离拆分、IPO/PIPE 及大额 VC 融资；
+   - **③ 宏观医药政策与监管风向（板块级推动/压制因素）**：FDA 审批决定/CRL/现场突击检查（如中印药企检查）、美国国会/两党选举与医疗立法走向、HHS/FDA/CMS 高层人事变动、IRA 医保药价谈判、PBM（药房福利管理）改革、关税与生物安全法案等一切对医药整体板块或细分赛道有潜在影响的重要政策事件；
+   - **④ 前沿科学与靶点突破**：新靶点/新机制验证、头对头竞争格局变化、AI 制药实质性突破、顶刊（Nature/Science/Cell/NEJM）重磅转化成果。
+2. **仅过滤纯噪音广告**：仅剔除纯求职招聘广告（Job openings/薪资调查）、纯会议买票促销、CDMO 外包硬广、以及与生命科学/医药健康完全无关的通用广告。
+3. **每一条新闻严格采用以下格式**：
    • 📌 **【中文简明标题】** (English Title)
-     💡 **核心要点**：一句话说明核心事实（包含相关公司、靶点/适应症、临床期别、关键疗效/安全性数据或交易金额）。
-     🔗 **原文链接**：从链接清单中匹配最相关的文章 URL（若无对应链接则写“见原邮件”）。
-4. 若整封邮件全为招聘报告/空壳问候/无药企研发新闻，请将 [VALID] 设为 NO，无需输出正文。
-5. 全文严禁出现“美股、炒股、买入、卖出、暴涨、暴跌”等敏感词。
+     💡 **核心要点**：清晰说明核心事实与潜在影响（包含相关药企/政策机构、靶点/适应症、临床期别、关键疗效/安全性数据、交易金额或对板块/公司的潜在推动逻辑）。
+     🔗 **原文链接**：从链接清单中匹配最相关的文章 URL（若无对应单篇链接则不写此行）。
+4. 若整封邮件 100% 全为招聘报告或纯会议买票广告、无任何上述四大维度资讯，请将 [VALID] 设为 NO，无需输出正文。
+5. 全文严禁出现“炒股、买入、卖出、加仓、止损”等敏感词。
 
 请严格按以下标签输出：
 [VALID]: YES 或 NO
-[MEDIA_NAME]: 媒体简短名称（如 BioSpace / Endpoints / Fierce Biotech 等，10字以内）
-[TOPIC_CN]: 本期速览主题（如：生科行业要闻速览 / 肿瘤与自免领域新进展 等，12字以内）
+[MEDIA_NAME]: 媒体简短名称（如 STAT News / Endpoints / BioSpace / Fierce Biotech / Nature Briefing 等，12字以内）
+[TOPIC_CN]: 本期速览核心主题（如：美大选医疗政策转向与M&A动态 / 肿瘤与罕见病临床进展 等，16字以内）
 [DIGEST_START]
-（在此处输出上述格式的精炼要闻列表）
+（在此处完整输出所有符合四大维度的要闻列表，应留尽留，严禁只挑3条）
 [DIGEST_END]"""
 
     raw, used_model = call_gemini(api_key, prompt, expect_json=False, use_search=False, models=GEMINI_TRIAGE_MODELS)
@@ -1415,6 +1437,11 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
 
     # 分支 A：生科行业综合速览 Newsletter
     if ev_type == "industry_digest":
+        norm_title = re.sub(r"[^a-z0-9]+", "", ev["title"].lower())
+        if processed_titles is not None and norm_title and norm_title in processed_titles:
+            print(f"[INFO] Skipped duplicate industry newsletter by title: {ev['title']}")
+            processed_ids.add(ev["id"])
+            return
         is_valid, media_name, topic_cn, digest_text = gemini_industry_digest(ev, api_key)
         if not is_valid or not digest_text.strip():
             print(f"[INFO] Skipped non-actionable industry newsletter: {ev['title']}")
@@ -1457,6 +1484,8 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
             ],
         )
         processed_ids.add(ev["id"])
+        if processed_titles is not None and norm_title:
+            processed_titles.add(norm_title)
         return
 
     # 分支 B：持仓标的个股催化剂（【官方】 vs 【第三方】）
@@ -1674,6 +1703,12 @@ def main(duration_minutes=0):
                             if ev["id"] not in processed_ids:
                                 process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
 
+                    if os.environ.get("ENABLE_GMAIL_IMAP", "0") == "1":
+                        gmail_ev = fetch_gmail_imap_events(config, portfolio, processed_ids, max_age_hours=24)
+                        for ev in gmail_ev:
+                            if ev["id"] not in processed_ids:
+                                process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
+
                     if os.environ.get("SYNC_DRIVE_VAULT", "0") == "1" and time.time() < end_time - 60:
                         try:
                             from vault_sync import sync_drive_vault
@@ -1687,13 +1722,6 @@ def main(duration_minutes=0):
                             )
                         except Exception as ve:
                             print(f"[WARN] Periodic vault sync check error: {ve}")
-
-                # 2. Gmail 检查已交由 Google Apps Script (Tickermonitor) 原生接管；仅在显式开启 ENABLE_GMAIL_IMAP=1 时才由 Python 轮询
-                if os.environ.get("ENABLE_GMAIL_IMAP", "0") == "1":
-                    gmail_ev = fetch_gmail_imap_events(config, portfolio, processed_ids, max_age_hours=24)
-                    for ev in gmail_ev:
-                        if ev["id"] not in processed_ids:
-                            process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
 
                 time.sleep(10)
             print(f"[INFO] Continuous Monitor Loop completed cleanly after {duration_minutes} minutes.")

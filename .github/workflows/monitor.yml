@@ -34,6 +34,7 @@ jobs:
           SPREADSHEET_ID: '1pIKfEy9UNPs32W5gBFJu3N5doqU-SKCvIBDjX-TMwGQ'
           MONITOR_DURATION_MINUTES: '14'
           SYNC_DRIVE_VAULT: '1'
+          ENABLE_GMAIL_IMAP: '1'
         run: python monitor.py
 
       - name: Ensure 24x7 Self-Relay Dispatch (Fail-Safe)
