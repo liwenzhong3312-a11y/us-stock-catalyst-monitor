@@ -5,11 +5,11 @@ Google Drive 生物医药投研库自动同步与中英对照 PDF 翻译引擎 (
 核心功能：
 1. 自动巡检并维护 Google Drive 投研库目录结构：
    - 00_网站与催化剂底稿同步 (Claude_Artifact_Sync)：存放从 Claude Artifact 导出的 .html/.tsx/.md/.json 源码或催化剂汇总表
-   - 每只持仓标的专属文件夹（如 ABSI_Absci, ARWR_Arrowhead, KRYS_Krystal, MANE_Veradermics）：
+   - 每只持仓标的专属文件夹（如 ABSI_Absci, ARWR_Arrowhead, KRYS_Krystal, MANE_Veradermics, PBLS, MSLE）：
      • 01_公司内部官方口径 (Deck_Transcript_SEC)：公司路演 PPT (Deck)、电话会纪要 (Transcript)、SEC 深度文件
      • 02_外部投行与独立研报 (SellSide_Consensus)：华尔街投行报告、市场预期共识 (Beat/Miss 阈值)、独立第三方分析
-     • 03_中英对照译文与解析 (Bilingual_Output)：系统自动生成的中英对照 PDF 与在线文档
-2. 支持多 API Key 轮询池（在 Config!B3 中用英文逗号分隔多个不同 GCP 项目的 Key），在长文档分块翻译时自动负载均衡与防限流切换。
+     • 注：自动生成的左英右中对照 PDF（`原文件名 [译].pdf`）直接原位保存在源文件所在的文件夹内，仅设上述 2 个子文件夹。
+2. 支持多 API Key 轮询池（在 Config!B3 中用英文逗号分隔 5 个独立密钥，配合 7 个 Gemini 模型构成 35 个独立配额桶），在长文档动态批处理翻译时自动负载均衡与防限流切换。
 3. 自动将提取出的【公司内部官方口径】、【外部投行预期共识】、【自建网站催化剂关注框架】写入 Google Sheet 的 `Vault` 标签页，供实时监控引擎 `monitor.py` 在新公告发布时自动联动比对。
 """
 
