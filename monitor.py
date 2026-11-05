@@ -37,8 +37,8 @@ SPREADSHEET_ID = os.environ.get(
 SEC_USER_AGENT = "AntigravityBiotechMonitor/3.0 (neo664939@gmail.com)"
 
 GEMINI_TRIAGE_MODELS = [
-    "gemini-3.6-flash",
     "gemini-3.5-flash",
+    "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
     "gemini-flash-lite-latest",
     "gemini-flash-latest",
@@ -46,8 +46,8 @@ GEMINI_TRIAGE_MODELS = [
 ]
 
 GEMINI_DEEP_MODELS = [
-    "gemini-3.6-flash",
     "gemini-3.5-flash",
+    "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
     "gemini-flash-lite-latest",
     "gemini-flash-latest",
@@ -1675,7 +1675,7 @@ def main(duration_minutes=0):
                                 portfolio,
                                 send_pushplus_fn=send_pushplus,
                                 deadline=end_time - 25,
-                                max_files_per_pass=1,
+                                max_files_per_pass=3,
                             )
                         except Exception as ve:
                             print(f"[WARN] Periodic vault sync check error: {ve}")

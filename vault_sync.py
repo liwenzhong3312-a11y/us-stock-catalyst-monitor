@@ -32,8 +32,8 @@ SPREADSHEET_ID = os.environ.get(
 )
 
 VAULT_MODELS = [
-    "gemini-3.6-flash",
     "gemini-3.5-flash",
+    "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
     "gemini-flash-lite-latest",
     "gemini-flash-latest",
@@ -42,6 +42,7 @@ VAULT_MODELS = [
 ]
 
 _KEY_INDEX = 0
+_FAILED_FILE_IDS_THIS_PROCESS = set()
 
 
 def parse_api_keys(raw_key_str):
@@ -1339,6 +1340,8 @@ def sync_drive_vault(
             print(f"[WARN] Failed syncing website artifact {fmeta['name']}: {e}")
 
     # 2. 巡检各持仓标的的 01_公司内部官方口径、02_外部投行与独立研报（以及标的根目录直接放入的文件）
+    # 先汇总所有待翻译文件，并按文件体积从小到大排序（优先在 20~40 秒内快速完成常规 4~25 页个股研报/纪要，最后处理 60~70 页大型行业书册，彻底杜绝大文件排在队首阻塞后续文件）
+    pending_candidates = []
     for ticker, s_folders in vault_tree["stocks"].items():
         stock = s_folders["stock"]
         for role_key, role_label in [
@@ -1350,10 +1353,6 @@ def sync_drive_vault(
             files = list_folder_files(access_token, folder_id)
             existing_names = {f["name"] for f in files}
             for fmeta in files:
-                if processed_count >= max_files_per_pass:
-                    break
-                if deadline and time.time() > deadline:
-                    break
                 fname = fmeta["name"]
                 if is_translated_or_temp_file(fname):
                     continue
@@ -1363,104 +1362,140 @@ def sync_drive_vault(
                 v_id = f"VAULT_{fmeta['id']}_{fmeta.get('modifiedTime', '')[:16]}"
                 if v_id in processed_vault_ids:
                     continue
-                mime = fmeta.get("mimeType", "")
-                print(f"[INFO] Translating & indexing new vault file for {ticker} ({role_label}): {fname}")
-                try:
-                    fname_low = fname.lower()
-                    mime_low = mime.lower()
-                    is_pdf = (
-                        "pdf" in mime_low
-                        or fname_low.endswith(".pdf")
-                        or mime_low in ("application/vnd.google-apps.document", "application/vnd.google-apps.presentation")
+                pending_candidates.append(
+                    (
+                        fmeta["id"] in _FAILED_FILE_IDS_THIS_PROCESS,
+                        int(fmeta.get("size") or 300000),
+                        ticker,
+                        stock,
+                        role_label,
+                        folder_id,
+                        existing_names,
+                        fmeta,
+                        v_id,
                     )
-                    is_office = (
-                        fname_low.endswith((".docx", ".doc", ".pptx", ".ppt"))
-                        or "wordprocessingml" in mime_low
-                        or "msword" in mime_low
-                        or "presentationml" in mime_low
-                        or "powerpoint" in mime_low
-                    )
+                )
 
-                    dual_pdf_bytes = None
-                    summary = ""
-                    bilingual_md = ""
-                    if is_pdf:
-                        raw_bytes = download_drive_file_bytes(access_token, fmeta)
-                        dual_pdf_bytes, summary, bilingual_md = translate_pdf_preserve_layout_side_by_side(
-                            api_keys, stock, role_label, fname, raw_bytes, deadline=deadline
-                        )
-                    elif is_office:
-                        pdf_bytes = convert_office_file_to_pdf_bytes(access_token, fmeta)
-                        dual_pdf_bytes, summary, bilingual_md = translate_pdf_preserve_layout_side_by_side(
-                            api_keys, stock, role_label, fname, pdf_bytes, deadline=deadline
-                        )
-                    else:
-                        raw_bytes = download_drive_file_bytes(access_token, fmeta)
-                        text_content = raw_bytes.decode("utf-8", errors="replace")
-                        prompt = f"""请将以下 {ticker} ({stock['company']}) 的【{role_label}】文档（{fname}）逐段翻译为严格左右双栏中英对照格式（每段严格使用 [EN] 英文原文 与 [CN] 中文精译 标签成对输出），并在开头提炼 300 字以内的核心要点（区分内部承诺或外部投行预期阈值）：\n\n{text_content[:25000]}"""
-                        bilingual_md, _ = call_gemini_with_rotation(
-                            api_keys, prompt, expect_json=False, deep_thinking=True
-                        )
-                        summary = (bilingual_md or "")[:400]
+    pending_candidates.sort(key=lambda item: (item[0], item[1]))
 
-                    if dual_pdf_bytes:
-                        pdf_link, doc_link = upload_pdf_bytes_to_drive(
-                            access_token,
-                            folder_id,
-                            base_name,
-                            dual_pdf_bytes,
-                        )
-                    else:
-                        if not bilingual_md or len(bilingual_md.strip()) < 80 or "文档解析为空" in bilingual_md:
-                            print(f"[WARN] Skipping PDF creation for {fname}: translation empty or invalid.")
-                            continue
-                        styled_html = markdown_to_styled_html(
-                            f"[{ticker}] {base_name} (中英对照精译版)",
-                            f"标的：{ticker} ({stock['company']}) ｜ 口径分类：{role_label} ｜ 原始文件：{fname}",
-                            summary,
-                            bilingual_md,
-                        )
-                        pdf_link, doc_link = create_bilingual_doc_and_pdf_in_drive(
-                            access_token,
-                            folder_id,
-                            base_name,
-                            styled_html,
-                        )
-                    existing_names.add(f"{base_name}[译].pdf")
-                    bj_time = (
-                        datetime.datetime.now(datetime.timezone.utc)
-                        + datetime.timedelta(hours=8)
-                    ).strftime("%Y-%m-%d %H:%M:%S")
-                    append_vault_sheet_row(
-                        access_token,
-                        [
-                            bj_time,
-                            ticker,
-                            role_label,
-                            fname,
-                            summary,
-                            pdf_link,
-                            doc_link,
-                            fmeta.get("webViewLink", ""),
-                            v_id,
-                        ],
-                    )
-                    knowledge_by_ticker.setdefault(ticker, []).append(
-                        f"🔹【{role_label} | {fname}】\n{summary}"
-                    )
-                    if send_pushplus_fn and push_token:
-                        send_pushplus_fn(
-                            push_token,
-                            f"📚【中英对照PDF已生成】{ticker} | {base_name[:20]}",
-                            f"<div style='font-family:sans-serif;line-height:1.68;font-size:14px;'>"
-                            f"<p><b>标的：</b>{ticker} ({stock['company']})<br/><b>口径分类：</b>{role_label}<br/><b>原始文件：</b>{html.escape(fname)}<br/><b>生成译稿：</b>{html.escape(base_name)}[译].pdf（已保存在同文件夹内）</p>"
-                            f"<div style='background:rgba(128,128,128,0.12);border-left:4px solid #f59e0b;padding:10px 12px;margin:10px 0;border-radius:4px;white-space:pre-wrap;font-size:14px;'><b>【核心结构化提炼】</b>\n{html.escape(summary)}</div>"
-                            f"<p style='margin-top:10px;'><a href='{pdf_link}'>👉 点击打开/下载 {html.escape(base_name)}[译].pdf</a></p>"
-                            f"</div>",
-                        )
-                    processed_vault_ids.add(v_id)
-                    processed_count += 1
-                except Exception as e:
-                    print(f"[WARN] Vault file process failed for {fname}: {e}")
+    for (
+        _was_failed,
+        _fsize,
+        ticker,
+        stock,
+        role_label,
+        folder_id,
+        existing_names,
+        fmeta,
+        v_id,
+    ) in pending_candidates:
+        if processed_count >= max_files_per_pass:
+            break
+        if deadline and time.time() > deadline:
+            break
+        fname = fmeta["name"]
+        base_name = os.path.splitext(fname)[0]
+        if f"{base_name}[译].pdf" in existing_names or v_id in processed_vault_ids:
+            continue
+        mime = fmeta.get("mimeType", "")
+        print(f"[INFO] Translating & indexing new vault file for {ticker} ({role_label}): {fname} (size={_fsize})")
+        try:
+            fname_low = fname.lower()
+            mime_low = mime.lower()
+            is_pdf = (
+                "pdf" in mime_low
+                or fname_low.endswith(".pdf")
+                or mime_low in ("application/vnd.google-apps.document", "application/vnd.google-apps.presentation")
+            )
+            is_office = (
+                fname_low.endswith((".docx", ".doc", ".pptx", ".ppt"))
+                or "wordprocessingml" in mime_low
+                or "msword" in mime_low
+                or "presentationml" in mime_low
+                or "powerpoint" in mime_low
+            )
+
+            dual_pdf_bytes = None
+            summary = ""
+            bilingual_md = ""
+            if is_pdf:
+                raw_bytes = download_drive_file_bytes(access_token, fmeta)
+                dual_pdf_bytes, summary, bilingual_md = translate_pdf_preserve_layout_side_by_side(
+                    api_keys, stock, role_label, fname, raw_bytes, deadline=deadline
+                )
+            elif is_office:
+                pdf_bytes = convert_office_file_to_pdf_bytes(access_token, fmeta)
+                dual_pdf_bytes, summary, bilingual_md = translate_pdf_preserve_layout_side_by_side(
+                    api_keys, stock, role_label, fname, pdf_bytes, deadline=deadline
+                )
+            else:
+                raw_bytes = download_drive_file_bytes(access_token, fmeta)
+                text_content = raw_bytes.decode("utf-8", errors="replace")
+                prompt = f"""请将以下 {ticker} ({stock['company']}) 的【{role_label}】文档（{fname}）逐段翻译为严格左右双栏中英对照格式（每段严格使用 [EN] 英文原文 与 [CN] 中文精译 标签成对输出），并在开头提炼 300 字以内的核心要点（区分内部承诺或外部投行预期阈值）：\n\n{text_content[:25000]}"""
+                bilingual_md, _ = call_gemini_with_rotation(
+                    api_keys, prompt, expect_json=False, deep_thinking=True
+                )
+                summary = (bilingual_md or "")[:400]
+
+            if dual_pdf_bytes:
+                pdf_link, doc_link = upload_pdf_bytes_to_drive(
+                    access_token,
+                    folder_id,
+                    base_name,
+                    dual_pdf_bytes,
+                )
+            else:
+                if not bilingual_md or len(bilingual_md.strip()) < 80 or "文档解析为空" in bilingual_md:
+                    print(f"[WARN] Skipping PDF creation for {fname}: translation empty or invalid.")
+                    continue
+                styled_html = markdown_to_styled_html(
+                    f"[{ticker}] {base_name} (中英对照精译版)",
+                    f"标的：{ticker} ({stock['company']}) ｜ 口径分类：{role_label} ｜ 原始文件：{fname}",
+                    summary,
+                    bilingual_md,
+                )
+                pdf_link, doc_link = create_bilingual_doc_and_pdf_in_drive(
+                    access_token,
+                    folder_id,
+                    base_name,
+                    styled_html,
+                )
+            existing_names.add(f"{base_name}[译].pdf")
+            bj_time = (
+                datetime.datetime.now(datetime.timezone.utc)
+                + datetime.timedelta(hours=8)
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            append_vault_sheet_row(
+                access_token,
+                [
+                    bj_time,
+                    ticker,
+                    role_label,
+                    fname,
+                    summary,
+                    pdf_link,
+                    doc_link,
+                    fmeta.get("webViewLink", ""),
+                    v_id,
+                ],
+            )
+            knowledge_by_ticker.setdefault(ticker, []).append(
+                f"🔹【{role_label} | {fname}】\n{summary}"
+            )
+            if send_pushplus_fn and push_token:
+                send_pushplus_fn(
+                    push_token,
+                    f"📚【中英对照PDF已生成】{ticker} | {base_name[:20]}",
+                    f"<div style='font-family:sans-serif;line-height:1.68;font-size:14px;'>"
+                    f"<p><b>标的：</b>{ticker} ({stock['company']})<br/><b>口径分类：</b>{role_label}<br/><b>原始文件：</b>{html.escape(fname)}<br/><b>生成译稿：</b>{html.escape(base_name)}[译].pdf（已保存在同文件夹内）</p>"
+                    f"<div style='background:rgba(128,128,128,0.12);border-left:4px solid #f59e0b;padding:10px 12px;margin:10px 0;border-radius:4px;white-space:pre-wrap;font-size:14px;'><b>【核心结构化提炼】</b>\n{html.escape(summary)}</div>"
+                    f"<p style='margin-top:10px;'><a href='{pdf_link}'>👉 点击打开/下载 {html.escape(base_name)}[译].pdf</a></p>"
+                    f"</div>",
+                )
+            processed_vault_ids.add(v_id)
+            processed_count += 1
+        except Exception as e:
+            _FAILED_FILE_IDS_THIS_PROCESS.add(fmeta["id"])
+            print(f"[WARN] Vault file process failed for {fname}: {e}")
 
     return knowledge_by_ticker
