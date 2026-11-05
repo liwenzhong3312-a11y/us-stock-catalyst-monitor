@@ -159,21 +159,68 @@ def _resolve_stock_subfolders(access_token, stock_folder_id):
     return f_internal, f_external
 
 
-def _auto_enrich_new_stock_metadata(api_keys, ticker, fallback_label):
-    """当用户在 Google Drive 新建标的文件夹时，自动调用 Gemini 补齐公司全称、交易所、核心管线药名匹配词及官网 IR 订阅链接"""
+def _auto_enrich_new_stock_metadata(api_keys, ticker, fallback_label, access_token=None, folder_ids=None):
+    """当用户在 Google Drive 新建标的文件夹时，自动结合 SEC 官方代码库、Yahoo 实时新闻流、云盘内文件名及 Gemini 补齐公司全称、交易所、核心管线药名匹配词及官网 IR 订阅链接"""
     default_meta = {
         "company": fallback_label if fallback_label and fallback_label.upper() != ticker else ticker,
         "exchange": "NASDAQ",
         "keywords": f"{ticker}, {fallback_label}" if fallback_label and fallback_label.upper() != ticker else ticker,
         "ir_url": "",
     }
+
+    live_hints = []
+    # 1. 从 SEC 官方 company_tickers_exchange.json 实时核查公司法定全称与交易所
+    try:
+        sec_req = urllib.request.Request(
+            "https://www.sec.gov/files/company_tickers_exchange.json",
+            headers={"User-Agent": "AntigravityBiotechMonitor/3.0 (neo664939@gmail.com)"},
+        )
+        with urllib.request.urlopen(sec_req, timeout=10) as resp:
+            sec_data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        for row in sec_data.get("data", []):
+            if len(row) >= 4 and str(row[2]).strip().upper() == ticker:
+                default_meta["company"] = str(row[1]).strip()
+                default_meta["exchange"] = str(row[3]).strip().upper() or "NASDAQ"
+                live_hints.append(f"SEC Official Company Name: {default_meta['company']} (Exchange: {default_meta['exchange']})")
+                break
+    except Exception:
+        pass
+
+    # 2. 从 Yahoo Finance RSS 实时拉取最新新闻标题与摘要（识别最新更名或核心临床药物代号）
+    try:
+        yf_url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={urllib.parse.quote(ticker)}&region=US&lang=en-US"
+        yf_req = urllib.request.Request(yf_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(yf_req, timeout=10) as resp:
+            root = ET.fromstring(resp.read())
+        for item in root.findall(".//item")[:5]:
+            t = (item.findtext("title") or "").strip()
+            d = (item.findtext("description") or "").strip()[:200]
+            if t:
+                live_hints.append(f"Yahoo News: {t} - {d}")
+    except Exception:
+        pass
+
+    # 3. 读取用户在云盘该文件夹下放入的研报/PPT文件名作为线索
+    if access_token and folder_ids:
+        for fid in folder_ids:
+            if not fid:
+                continue
+            try:
+                for f in list_folder_files(access_token, fid)[:8]:
+                    live_hints.append(f"Drive File Name: {f.get('name', '')}")
+            except Exception:
+                pass
+
     if not api_keys:
         return default_meta
+
+    hints_block = "\n".join(live_hints) if live_hints else "无额外实时线索"
     prompt = (
-        f"请查询美股生物医药上市公司股票代码 {ticker}（提示名：{fallback_label}），并严格以 JSON 格式返回以下 4 个字段：\n"
+        f"请根据以下实时检索线索与您的知识库，查询美股生物医药公司股票代码 {ticker}（文件夹提示名：{fallback_label}），并严格以 JSON 格式返回以下 4 个字段：\n"
+        f"【实时检索线索】：\n{hints_block}\n\n"
         "{\n"
-        '  "company": "公司英文标准全称（如 Satellos Bioscience Inc.）",\n'
-        '  "exchange": "上市交易所（NASDAQ 或 NYSE）",\n'
+        '  "company": "公司英文标准全称（如 Satellos Bioscience Inc. 或 Parabilis Medicines, Inc.）",\n'
+        '  "exchange": "上市交易所（NASDAQ、NYSE 或 Private/Pre-IPO）",\n'
         '  "keywords": "用英文逗号分隔的专属匹配词：包含股票代码、公司简称、公司全称、以及 1~3 个核心临床研发管线药物代号/通用名（如 MSLE, Satellos, Satellos Bioscience, SAT-3247）",\n'
         '  "ir_url": "公司官方网站的 Investor Relations (IR) 或 Email Alerts 投资者邮件订阅页面完整 URL（以 https:// 开头）"\n'
         "}"
@@ -188,7 +235,7 @@ def _auto_enrich_new_stock_metadata(api_keys, ticker, fallback_label):
             if isinstance(parsed, dict) and parsed.get("company"):
                 return {
                     "company": str(parsed.get("company") or default_meta["company"]).strip(),
-                    "exchange": str(parsed.get("exchange") or "NASDAQ").strip().upper(),
+                    "exchange": str(parsed.get("exchange") or default_meta["exchange"]).strip().upper(),
                     "keywords": str(parsed.get("keywords") or default_meta["keywords"]).strip(),
                     "ir_url": str(parsed.get("ir_url") or "").strip(),
                 }
@@ -273,7 +320,9 @@ def ensure_vault_folders(access_token, portfolio, api_keys=None):
             continue
         comp_label = (m_tk.group(2) or tk_up).strip()
         f_internal, f_external = _resolve_stock_subfolders(access_token, ef["id"])
-        enriched = _auto_enrich_new_stock_metadata(api_keys, tk_up, comp_label)
+        enriched = _auto_enrich_new_stock_metadata(
+            api_keys, tk_up, comp_label, access_token=access_token, folder_ids=[ef["id"], f_internal["id"], f_external["id"]]
+        )
         comp_full = enriched["company"]
         exch = enriched["exchange"]
         kw_str = enriched["keywords"]
