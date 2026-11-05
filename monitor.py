@@ -376,6 +376,13 @@ def load_sheet_state(access_token):
         keywords = list(dict.fromkeys([company_clean] + kw_list))
         avg_cost = str(row[4]).strip() if len(row) > 4 and str(row[4]).strip() else "未设置"
         pos_note = str(row[5]).strip() if len(row) > 5 and str(row[5]).strip() else "核心跟踪"
+        ir_url = str(row[7]).strip() if len(row) > 7 and str(row[7]).strip() else ""
+        if ir_url:
+            m_dom = re.search(r"https?://(?:www\.|ir\.|investors?\.)?([a-zA-Z0-9\-]+\.[a-zA-Z]{2,})", ir_url)
+            if m_dom:
+                root_dom = m_dom.group(1).lower()
+                if root_dom not in OFFICIAL_IR_DOMAINS:
+                    OFFICIAL_IR_DOMAINS.append(root_dom)
 
         portfolio.append(
             {
@@ -386,6 +393,7 @@ def load_sheet_state(access_token):
                 "keywords": keywords,
                 "avg_cost": avg_cost,
                 "pos_note": pos_note,
+                "ir_url": ir_url,
             }
         )
 

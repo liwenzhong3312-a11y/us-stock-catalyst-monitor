@@ -159,7 +159,45 @@ def _resolve_stock_subfolders(access_token, stock_folder_id):
     return f_internal, f_external
 
 
-def ensure_vault_folders(access_token, portfolio):
+def _auto_enrich_new_stock_metadata(api_keys, ticker, fallback_label):
+    """当用户在 Google Drive 新建标的文件夹时，自动调用 Gemini 补齐公司全称、交易所、核心管线药名匹配词及官网 IR 订阅链接"""
+    default_meta = {
+        "company": fallback_label if fallback_label and fallback_label.upper() != ticker else ticker,
+        "exchange": "NASDAQ",
+        "keywords": f"{ticker}, {fallback_label}" if fallback_label and fallback_label.upper() != ticker else ticker,
+        "ir_url": "",
+    }
+    if not api_keys:
+        return default_meta
+    prompt = (
+        f"请查询美股生物医药上市公司股票代码 {ticker}（提示名：{fallback_label}），并严格以 JSON 格式返回以下 4 个字段：\n"
+        "{\n"
+        '  "company": "公司英文标准全称（如 Satellos Bioscience Inc.）",\n'
+        '  "exchange": "上市交易所（NASDAQ 或 NYSE）",\n'
+        '  "keywords": "用英文逗号分隔的专属匹配词：包含股票代码、公司简称、公司全称、以及 1~3 个核心临床研发管线药物代号/通用名（如 MSLE, Satellos, Satellos Bioscience, SAT-3247）",\n'
+        '  "ir_url": "公司官方网站的 Investor Relations (IR) 或 Email Alerts 投资者邮件订阅页面完整 URL（以 https:// 开头）"\n'
+        "}"
+    )
+    try:
+        raw, _ = call_gemini_with_rotation(
+            api_keys, prompt, expect_json=True, deep_thinking=False
+        )
+        if raw:
+            cleaned = re.sub(r"^```json\s*|\s*```$", "", raw.strip())
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, dict) and parsed.get("company"):
+                return {
+                    "company": str(parsed.get("company") or default_meta["company"]).strip(),
+                    "exchange": str(parsed.get("exchange") or "NASDAQ").strip().upper(),
+                    "keywords": str(parsed.get("keywords") or default_meta["keywords"]).strip(),
+                    "ir_url": str(parsed.get("ir_url") or "").strip(),
+                }
+    except Exception as e:
+        print(f"[WARN] Auto-enrich metadata for {ticker} failed: {e}")
+    return default_meta
+
+
+def ensure_vault_folders(access_token, portfolio, api_keys=None):
     """确保 Google Drive 投研库及所有持仓标的子目录完整存在（同时支持识别用户在云盘手动新建的标的文件夹并双向同步至 Portfolio 表）"""
     root = None
     try:
@@ -235,14 +273,21 @@ def ensure_vault_folders(access_token, portfolio):
             continue
         comp_label = (m_tk.group(2) or tk_up).strip()
         f_internal, f_external = _resolve_stock_subfolders(access_token, ef["id"])
+        enriched = _auto_enrich_new_stock_metadata(api_keys, tk_up, comp_label)
+        comp_full = enriched["company"]
+        exch = enriched["exchange"]
+        kw_str = enriched["keywords"]
+        ir_url = enriched["ir_url"]
+        kw_list = [k.strip() for k in re.split(r"[,，]", kw_str) if k.strip()] or [tk_up, comp_full]
         new_stock_obj = {
             "ticker": tk_up,
-            "company": comp_label,
-            "company_clean": comp_label,
-            "exchange": "NASDAQ",
-            "keywords": [tk_up, comp_label],
+            "company": comp_full,
+            "company_clean": comp_full.split(",")[0].strip(),
+            "exchange": exch,
+            "keywords": list(dict.fromkeys([comp_full.split(",")[0].strip()] + kw_list)),
             "avg_cost": "未设置",
-            "pos_note": "云盘新建自动同步",
+            "pos_note": "核心跟踪 (云盘自动同步)",
+            "ir_url": ir_url,
         }
         stocks_map[tk_up] = {
             "stock": new_stock_obj,
@@ -251,11 +296,11 @@ def ensure_vault_folders(access_token, portfolio):
             "external": f_external,
         }
         portfolio.append(new_stock_obj)
-        # 自动将该新标的追加到 Google Sheet Portfolio 表，实现双向全自动同步
+        # 自动将该新标的及补齐的公司名、管线关键词、IR链接追加到 Google Sheet Portfolio 表，实现双向全自动同步
         try:
             append_url = (
                 f"https://sheets.googleapis.com/v4/spreadsheets/{SPREADSHEET_ID}"
-                f"/values/{urllib.parse.quote('Portfolio!A:G')}:append?valueInputOption=USER_ENTERED"
+                f"/values/{urllib.parse.quote('Portfolio!A:H')}:append?valueInputOption=USER_ENTERED"
             )
             http_json(
                 append_url,
@@ -263,11 +308,11 @@ def ensure_vault_folders(access_token, portfolio):
                 headers={"Authorization": f"Bearer {access_token}"},
                 payload={
                     "values": [
-                        [tk_up, comp_label, "NASDAQ", comp_label, "", "云盘手动新建自动纳管", "YES"]
+                        [tk_up, comp_full, exch, kw_str, "", "核心跟踪 (云盘自动同步)", "YES", ir_url]
                     ]
                 },
             )
-            print(f"[INFO] Auto-registered new Drive stock folder '{ef_name}' ({tk_up}) into Portfolio sheet.")
+            print(f"[INFO] Auto-registered & enriched new Drive stock folder '{ef_name}' ({tk_up} -> {comp_full}) into Portfolio sheet.")
         except Exception as e:
             print(f"[WARN] Auto-registering {tk_up} to Portfolio failed: {e}")
 
@@ -1250,7 +1295,7 @@ def sync_drive_vault(
     if not api_keys:
         return knowledge_by_ticker
 
-    vault_tree = ensure_vault_folders(access_token, portfolio)
+    vault_tree = ensure_vault_folders(access_token, portfolio, api_keys=api_keys)
     processed_count = 0
 
     # 1. 巡检 00_网站与催化剂底稿同步 (Claude_Artifact_Sync)
