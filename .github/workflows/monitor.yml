@@ -13,7 +13,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 18
+    timeout-minutes: 25
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -27,9 +27,18 @@ jobs:
         run: pip install --quiet pypdf pymupdf
 
       - name: Run Real-Time SEC, Gmail IMAP, Media & Vault Sync
+        timeout-minutes: 16
+        continue-on-error: true
         env:
           GSHEETS_TOKEN_JSON: ${{ secrets.GSHEETS_TOKEN_JSON }}
           SPREADSHEET_ID: '1pIKfEy9UNPs32W5gBFJu3N5doqU-SKCvIBDjX-TMwGQ'
           MONITOR_DURATION_MINUTES: '14'
           SYNC_DRIVE_VAULT: '1'
         run: python monitor.py
+
+      - name: Ensure 24x7 Self-Relay Dispatch (Fail-Safe)
+        if: always()
+        env:
+          GSHEETS_TOKEN_JSON: ${{ secrets.GSHEETS_TOKEN_JSON }}
+          SPREADSHEET_ID: '1pIKfEy9UNPs32W5gBFJu3N5doqU-SKCvIBDjX-TMwGQ'
+        run: python -c "import monitor; tok = monitor.get_google_access_token(); cfg, _, _, _ = monitor.load_sheet_state(tok); monitor.trigger_next_github_relay(cfg)"
