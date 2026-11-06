@@ -376,13 +376,315 @@ def list_folder_files(access_token, folder_id):
     url = "https://www.googleapis.com/drive/v3/files?" + urllib.parse.urlencode(
         {
             "q": q,
-            "fields": "files(id,name,mimeType,modifiedTime,size,webViewLink)",
+            "fields": "files(id,name,mimeType,createdTime,modifiedTime,size,webViewLink)",
             "orderBy": "modifiedTime desc",
-            "pageSize": 25,
+            "pageSize": 200,
         }
     )
     res = http_json(url, headers={"Authorization": f"Bearer {access_token}"})
     return res.get("files", [])
+
+
+_MONTH_MAP = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
+
+
+def drive_rename_file(access_token, file_id, new_name):
+    """原位重命名 Google Drive 中的文件，保持 File ID 与所在文件夹不变"""
+    url = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=id,name"
+    return http_json(
+        url,
+        method="PATCH",
+        headers={"Authorization": f"Bearer {access_token}"},
+        payload={"name": new_name},
+    )
+
+
+def _extract_date_and_clean_stem(fname, file_bytes=None, fmeta=None):
+    """
+    从文件名、PDF/Word 前两页正文及元数据中智能提取真实发布日期，
+    并将文件名统一规范化为 `YYYY-MM-DD-干净标题` 格式。
+    返回: (is_already_standard, date_str_yyyy_mm_dd, clean_stem)
+    """
+    stem, _ = os.path.splitext(fname)
+    stem = stem.strip()
+
+    # 1. 若已经是以标准 YYYY-MM-DD- 开头，直接返回
+    m_std = re.match(
+        r"^(20[123]\d-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01]))-(.+)$", stem
+    )
+    if m_std:
+        return True, m_std.group(1), m_std.group(2).strip()
+
+    # 2. 若开头为紧凑型或点号/下划线/空格分隔的日期（如 20260919-xxx、2026.09.15_xxx、20260916 xxx）
+    m_lead = re.match(
+        r"^(20[123]\d)[.\-_/\s]?(0?[1-9]|1[0-2])[.\-_/\s]?(0?[1-9]|[12]\d|3[01])(?:[.\-_/\s]+)(.+)$",
+        stem,
+    )
+    if m_lead:
+        yr, mo, dy, rest = (
+            int(m_lead.group(1)),
+            int(m_lead.group(2)),
+            int(m_lead.group(3)),
+            m_lead.group(4).strip(),
+        )
+        return False, f"{yr:04d}-{mo:02d}-{dy:02d}", rest
+
+    # 3. 检查文件名中段或末尾是否带有完整日期（如 _7-15-26、2026-10-14、Oct 14, 2026）
+    m_ymd_any = re.search(
+        r"(?<!\d)(20[123]\d)[.\-_]?(0[1-9]|1[0-2])[.\-_]?(0[1-9]|[12]\d|3[01])(?!\d)",
+        stem,
+    )
+    if m_ymd_any:
+        yr, mo, dy = (
+            int(m_ymd_any.group(1)),
+            int(m_ymd_any.group(2)),
+            int(m_ymd_any.group(3)),
+        )
+        return False, f"{yr:04d}-{mo:02d}-{dy:02d}", stem
+
+    m_us_date = re.search(
+        r"(?:^|[_\-\s])(0?[1-9]|1[0-2])[.\-_](0?[1-9]|[12]\d|3[01])[.\-_](20[123]\d|[23]\d)(?:$|[_\-\s\(])",
+        stem,
+    )
+    if m_us_date:
+        mo, dy, yr_raw = (
+            int(m_us_date.group(1)),
+            int(m_us_date.group(2)),
+            int(m_us_date.group(3)),
+        )
+        yr = yr_raw + 2000 if yr_raw < 100 else yr_raw
+        return False, f"{yr:04d}-{mo:02d}-{dy:02d}", stem
+
+    m_en_fname = re.search(
+        r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(20[123]\d)\b",
+        stem,
+        re.I,
+    )
+    if m_en_fname:
+        mo = _MONTH_MAP[m_en_fname.group(1).lower().rstrip(".")]
+        dy = int(m_en_fname.group(2))
+        yr = int(m_en_fname.group(3))
+        return False, f"{yr:04d}-{mo:02d}-{dy:02d}", stem
+
+    # 4. 从文档内容（PDF 前两页正文 + PDF CreationDate 元数据 / Word 正文）提取真实发布日
+    hint_ym = None
+    m_ym_fname = re.search(
+        r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(20[123]\d)\b",
+        stem,
+        re.I,
+    )
+    if m_ym_fname:
+        hint_ym = (
+            int(m_ym_fname.group(2)),
+            _MONTH_MAP[m_ym_fname.group(1).lower().rstrip(".")],
+        )
+
+    if file_bytes:
+        fname_low = fname.lower()
+        if fname_low.endswith(".pdf") or file_bytes[:4] == b"%PDF":
+            try:
+                import pymupdf
+
+                doc = pymupdf.open(stream=file_bytes, filetype="pdf")
+                first_pages_text = "\n".join(
+                    doc[p].get_text("text") for p in range(min(2, len(doc)))
+                )
+                # 4a. 优先匹配首页/次页显式写出的完整日期（如 October 14, 2026 或 August 4, 2026）
+                m_page_en = re.search(
+                    r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(20[123]\d)\b",
+                    first_pages_text,
+                    re.I,
+                )
+                if m_page_en:
+                    mo = _MONTH_MAP[m_page_en.group(1).lower().rstrip(".")]
+                    dy = int(m_page_en.group(2))
+                    yr = int(m_page_en.group(3))
+                    if 1 <= dy <= 31:
+                        return False, f"{yr:04d}-{mo:02d}-{dy:02d}", stem
+
+                m_page_cn = re.search(
+                    r"(20[123]\d)\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日",
+                    first_pages_text,
+                )
+                if m_page_cn:
+                    yr, mo, dy = (
+                        int(m_page_cn.group(1)),
+                        int(m_page_cn.group(2)),
+                        int(m_page_cn.group(3)),
+                    )
+                    if 1 <= mo <= 12 and 1 <= dy <= 31:
+                        return False, f"{yr:04d}-{mo:02d}-{dy:02d}", stem
+
+                if not hint_ym:
+                    m_ym_page = re.search(
+                        r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(20[123]\d)\b",
+                        first_pages_text,
+                        re.I,
+                    )
+                    if m_ym_page:
+                        hint_ym = (
+                            int(m_ym_page.group(2)),
+                            _MONTH_MAP[m_ym_page.group(1).lower().rstrip(".")],
+                        )
+
+                # 4b. 检查 PDF CreationDate / ModDate 元数据（如 D:20261020101306-04'00'）
+                for meta_key in ("creationDate", "modDate"):
+                    raw_meta_dt = (doc.metadata or {}).get(meta_key) or ""
+                    m_meta = re.search(
+                        r"D:(20[123]\d)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])",
+                        raw_meta_dt,
+                    )
+                    if m_meta:
+                        yr, mo, dy = (
+                            int(m_meta.group(1)),
+                            int(m_meta.group(2)),
+                            int(m_meta.group(3)),
+                        )
+                        if not hint_ym or hint_ym == (yr, mo):
+                            return False, f"{yr:04d}-{mo:02d}-{dy:02d}", stem
+            except Exception:
+                pass
+        elif fname_low.endswith(".docx"):
+            try:
+                docx_txt = extract_docx_text(file_bytes)[:2500]
+                m_doc_en = re.search(
+                    r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(20[123]\d)\b",
+                    docx_txt,
+                    re.I,
+                )
+                if m_doc_en:
+                    mo = _MONTH_MAP[m_doc_en.group(1).lower().rstrip(".")]
+                    dy = int(m_doc_en.group(2))
+                    yr = int(m_doc_en.group(3))
+                    return False, f"{yr:04d}-{mo:02d}-{dy:02d}", stem
+            except Exception:
+                pass
+
+    if hint_ym:
+        return False, f"{hint_ym[0]:04d}-{hint_ym[1]:02d}-01", stem
+
+    # 5. 兜底使用云盘文件创建时间或修改时间
+    if fmeta:
+        for tkey in ("createdTime", "modifiedTime"):
+            tval = (fmeta.get(tkey) or "")[:10]
+            if re.match(r"^20[123]\d-\d{2}-\d{2}$", tval):
+                return False, tval, stem
+
+    today_str = (
+        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
+    ).strftime("%Y-%m-%d")
+    return False, today_str, stem
+
+
+def normalize_folder_filenames(access_token, files):
+    """
+    对文件夹内的所有原始文件及其配对的 `[译].pdf` 自动执行 `YYYY-MM-DD-` 前缀标准化重命名：
+    - 若文件名已带日期（如 `20260919-...` 或 `2026.09.15_...` 或 `_7-15-26`），直接零下载毫秒级重命名；
+    - 若文件名不含具体日（如 `Veradermics Investor Deck - October 2026.pdf`），自动读取文档首页与 PDF CreationDate 提取真实发布日并重命名；
+    - 同时将同目录下已生成的对应 `原文件名[译].pdf` 一并重命名为 `YYYY-MM-DD-原文件名[译].pdf`，保持严格配对且不触发重复翻译。
+    """
+    by_name = {f["name"]: f for f in files}
+    for fmeta in list(files):
+        fname = fmeta.get("name", "")
+        if not fname or is_translated_or_temp_file(fname):
+            continue
+        old_base, ext = os.path.splitext(fname)
+        is_std, date_str, clean_stem = _extract_date_and_clean_stem(
+            fname, file_bytes=None, fmeta=None
+        )
+        if is_std:
+            continue
+
+        # 判断是否仅凭文件名就已经提取到了精确日期；若尚未提取到精确日期，则下载文件读取首页与元数据
+        has_date_in_name = bool(
+            re.match(
+                r"^(20[123]\d)[.\-_/\s]?(0?[1-9]|1[0-2])[.\-_/\s]?(0?[1-9]|[12]\d|3[01])(?:[.\-_/\s]+)",
+                old_base,
+            )
+            or re.search(
+                r"(?<!\d)(20[123]\d)[.\-_]?(0[1-9]|1[0-2])[.\-_]?(0[1-9]|[12]\d|3[01])(?!\d)",
+                old_base,
+            )
+            or re.search(
+                r"(?:^|[_\-\s])(0?[1-9]|1[0-2])[.\-_](0?[1-9]|[12]\d|3[01])[.\-_](20[123]\d|[23]\d)(?:$|[_\-\s\(])",
+                old_base,
+            )
+            or re.search(
+                r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(20[123]\d)\b",
+                old_base,
+                re.I,
+            )
+        )
+        raw_bytes = None
+        if not has_date_in_name:
+            try:
+                raw_bytes = download_drive_file_bytes(access_token, fmeta)
+            except Exception:
+                raw_bytes = None
+        _, date_str, clean_stem = _extract_date_and_clean_stem(
+            fname, file_bytes=raw_bytes, fmeta=fmeta
+        )
+        new_base = f"{date_str}-{clean_stem}"
+        new_name = f"{new_base}{ext}"
+        if new_name == fname:
+            continue
+
+        try:
+            drive_rename_file(access_token, fmeta["id"], new_name)
+            print(f"[INFO] Standardized filename: '{fname}' -> '{new_name}'")
+            by_name.pop(fname, None)
+            fmeta["name"] = new_name
+            by_name[new_name] = fmeta
+
+            # 若同目录下已存在对应的 [译].pdf，同步重命名以保持配对
+            for suffix in ("[译].pdf", " [译].pdf", "【译】.pdf"):
+                old_trans_name = f"{old_base}{suffix}"
+                if old_trans_name in by_name:
+                    trans_meta = by_name.pop(old_trans_name)
+                    new_trans_name = f"{new_base}[译].pdf"
+                    drive_rename_file(access_token, trans_meta["id"], new_trans_name)
+                    trans_meta["name"] = new_trans_name
+                    by_name[new_trans_name] = trans_meta
+                    print(
+                        f"[INFO] Standardized paired translation: '{old_trans_name}' -> '{new_trans_name}'"
+                    )
+        except Exception as e:
+            print(f"[WARN] Failed renaming '{fname}' to '{new_name}': {e}")
+
+    # 兜底检查：若存在单独的 [译].pdf 尚未带 YYYY-MM-DD- 前缀，同样自动规范化
+    for fmeta in list(files):
+        fname = fmeta.get("name", "")
+        if not fname.endswith(("[译].pdf", "【译】.pdf")):
+            continue
+        raw_stem = re.sub(r"(\s*\[译\]|\s*【译】)+$", "", os.path.splitext(fname)[0])
+        is_std, date_str, clean_stem = _extract_date_and_clean_stem(
+            raw_stem + ".pdf", file_bytes=None, fmeta=fmeta
+        )
+        if not is_std:
+            new_trans_name = f"{date_str}-{clean_stem}[译].pdf"
+            if new_trans_name != fname:
+                try:
+                    drive_rename_file(access_token, fmeta["id"], new_trans_name)
+                    fmeta["name"] = new_trans_name
+                    print(
+                        f"[INFO] Standardized standalone translation: '{fname}' -> '{new_trans_name}'"
+                    )
+                except Exception as e:
+                    print(f"[WARN] Failed renaming translation '{fname}': {e}")
+    return files
 
 
 def extract_docx_text(docx_bytes):
@@ -1348,7 +1650,9 @@ def sync_drive_vault(
     processed_count = 0
 
     # 1. 巡检 00_网站与催化剂底稿同步 (Claude_Artifact_Sync)
-    sync_files = list_folder_files(access_token, vault_tree["sync_folder"]["id"])
+    sync_files = normalize_folder_filenames(
+        access_token, list_folder_files(access_token, vault_tree["sync_folder"]["id"])
+    )
     existing_sync_names = {f["name"] for f in sync_files}
     for fmeta in sync_files:
         if processed_count >= max_files_per_pass:
@@ -1444,7 +1748,9 @@ def sync_drive_vault(
             ("folder", "标的主目录直接上传文档"),
         ]:
             folder_id = s_folders[role_key]["id"]
-            files = list_folder_files(access_token, folder_id)
+            files = normalize_folder_filenames(
+                access_token, list_folder_files(access_token, folder_id)
+            )
             existing_names = {f["name"] for f in files}
             for fmeta in files:
                 fname = fmeta["name"]
