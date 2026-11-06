@@ -499,39 +499,11 @@ def _extract_date_and_clean_stem(fname, file_bytes=None, fmeta=None):
                 import pymupdf
 
                 doc = pymupdf.open(stream=file_bytes, filetype="pdf")
-                first_pages_text = "\n".join(
-                    doc[p].get_text("text") for p in range(min(2, len(doc)))
-                )
-                # 4a. 优先匹配首页/次页显式写出的完整日期（如 October 14, 2026 或 August 4, 2026）
-                m_page_en = re.search(
-                    r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(20[123]\d)\b",
-                    first_pages_text,
-                    re.I,
-                )
-                if m_page_en:
-                    mo = _MONTH_MAP[m_page_en.group(1).lower().rstrip(".")]
-                    dy = int(m_page_en.group(2))
-                    yr = int(m_page_en.group(3))
-                    if 1 <= dy <= 31:
-                        return False, f"{yr:04d}-{mo:02d}-{dy:02d}", stem
-
-                m_page_cn = re.search(
-                    r"(20[123]\d)\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日",
-                    first_pages_text,
-                )
-                if m_page_cn:
-                    yr, mo, dy = (
-                        int(m_page_cn.group(1)),
-                        int(m_page_cn.group(2)),
-                        int(m_page_cn.group(3)),
-                    )
-                    if 1 <= mo <= 12 and 1 <= dy <= 31:
-                        return False, f"{yr:04d}-{mo:02d}-{dy:02d}", stem
-
+                page1_text = doc[0].get_text("text") if len(doc) > 0 else ""
                 if not hint_ym:
                     m_ym_page = re.search(
                         r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(20[123]\d)\b",
-                        first_pages_text,
+                        page1_text,
                         re.I,
                     )
                     if m_ym_page:
@@ -539,6 +511,32 @@ def _extract_date_and_clean_stem(fname, file_bytes=None, fmeta=None):
                             int(m_ym_page.group(2)),
                             _MONTH_MAP[m_ym_page.group(1).lower().rstrip(".")],
                         )
+
+                # 4a. 优先匹配封面首页（Page 1）显式写出的完整发布日期（如 October 14, 2026 或 August 4, 2026），避免误抓内页财报截止日（如 as of June 30）
+                m_page_en = re.search(
+                    r"\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(20[123]\d)\b",
+                    page1_text,
+                    re.I,
+                )
+                if m_page_en:
+                    mo = _MONTH_MAP[m_page_en.group(1).lower().rstrip(".")]
+                    dy = int(m_page_en.group(2))
+                    yr = int(m_page_en.group(3))
+                    if 1 <= dy <= 31 and (not hint_ym or hint_ym == (yr, mo)):
+                        return False, f"{yr:04d}-{mo:02d}-{dy:02d}", stem
+
+                m_page_cn = re.search(
+                    r"(20[123]\d)\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日",
+                    page1_text,
+                )
+                if m_page_cn:
+                    yr, mo, dy = (
+                        int(m_page_cn.group(1)),
+                        int(m_page_cn.group(2)),
+                        int(m_page_cn.group(3)),
+                    )
+                    if 1 <= mo <= 12 and 1 <= dy <= 31 and (not hint_ym or hint_ym == (yr, mo)):
+                        return False, f"{yr:04d}-{mo:02d}-{dy:02d}", stem
 
                 # 4b. 检查 PDF CreationDate / ModDate 元数据（如 D:20261020101306-04'00'）
                 for meta_key in ("creationDate", "modDate"):
