@@ -1477,7 +1477,21 @@ def format_body_for_wechat_html(text):
                 esc = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc)
                 out_parts.append(f'<div style="font-weight:bold;margin:10px 0 4px 0;">{esc}</div>')
                 continue
+            # 过滤无有效网址的空“原文链接”行
+            if re.match(r"^🔗?\s*(?:\*\*)?原文链接(?:\*\*)?\s*[：:]?\s*(?:无|暂无|N/?A|none|-)?$", s, re.I):
+                continue
             esc = html.escape(s)
+            # 将 "🔗 **原文链接**：https://..." 或 "[原文链接](https://...)" 统一转换为仅在“原文链接”4个字上挂载超链接，隐藏冗长裸网址
+            esc = re.sub(
+                r"(?:\*\*)?原文链接(?:\*\*)?\s*[：:]\s*(?:\[[^\]]*\]\()?(https?://[^\s<>\"\)]+)\)?",
+                r'<a href="\1" style="color:#2563eb;text-decoration:underline;font-weight:bold;">原文链接</a>',
+                esc,
+            )
+            esc = re.sub(
+                r"(?:\*\*)?\[(?:\*\*)?([^\]]+?)(?:\*\*)?\]\((https?://[^\s<>\"\)]+)\)(?:\*\*)?",
+                r'<a href="\2" style="color:#2563eb;text-decoration:underline;font-weight:bold;">\1</a>',
+                esc,
+            )
             esc = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc)
             # 确保开头导语中的所有 • 要点 (Highlights) 强制以粗体展示
             if in_opening_highlights and s.startswith(("•", "·", "* ")) and "<b>" not in esc:
@@ -1543,7 +1557,7 @@ def gemini_industry_digest(ev, api_key):
 3. **每一条新闻严格采用以下格式**：
    • 📌 **【中文简明标题】** (English Title)
      💡 **核心要点**：清晰说明核心事实与潜在影响（包含相关药企/政策机构、靶点/适应症、临床期别、关键疗效/安全性数据、交易金额或对板块/公司的潜在推动逻辑）。
-     🔗 **原文链接**：从链接清单中匹配最相关的文章 URL（若无对应单篇链接则不写此行）。
+     🔗 [原文链接](匹配的完整文章URL)（从链接清单中匹配最相关的文章 URL，超链接仅挂在“原文链接”4个字上；若无对应单篇链接则不写此行）。
 4. 若整封邮件 100% 全为招聘报告或纯会议买票广告、无任何上述四大维度资讯，请将 [VALID] 设为 NO，无需输出正文。
 5. 全文严禁出现“炒股、买入、卖出、加仓、止损”等敏感词。
 
