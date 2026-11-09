@@ -1799,6 +1799,30 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
         processed_titles.add(norm_title)
 
 
+def _us_eastern_now(now_utc=None):
+    """获取美国纽约实时时间（自动精确处理每年 3 月第二个周日夏令时 EDT UTC-4 与 11 月第一个周日冬令时 EST UTC-5，兼容 Linux/Windows 无依赖环境）"""
+    if now_utc is None:
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        return now_utc.astimezone(ZoneInfo("America/New_York")), now_utc.astimezone(ZoneInfo("America/New_York")).tzname() or "ET"
+    except Exception:
+        yr = now_utc.year
+        # 3月第二个周日 07:00 UTC (02:00 EST) 进入夏令时 EDT (UTC-4)
+        mar1 = datetime.datetime(yr, 3, 1, tzinfo=datetime.timezone.utc)
+        first_sun_mar = 1 + (6 - mar1.weekday()) % 7
+        dst_start_utc = datetime.datetime(yr, 3, first_sun_mar + 7, 7, 0, tzinfo=datetime.timezone.utc)
+        # 11月第一个周日 06:00 UTC (02:00 EDT) 回到冬令时 EST (UTC-5)
+        nov1 = datetime.datetime(yr, 11, 1, tzinfo=datetime.timezone.utc)
+        first_sun_nov = 1 + (6 - nov1.weekday()) % 7
+        dst_end_utc = datetime.datetime(yr, 11, first_sun_nov, 6, 0, tzinfo=datetime.timezone.utc)
+        if dst_start_utc <= now_utc < dst_end_utc:
+            tz = datetime.timezone(datetime.timedelta(hours=-4), name="EDT")
+            return now_utc.astimezone(tz), "EDT"
+        else:
+            tz = datetime.timezone(datetime.timedelta(hours=-5), name="EST")
+            return now_utc.astimezone(tz), "EST"
+
+
 def get_us_market_schedule_state(now_utc=None):
     """
     基于美国纽约法定时间 (America/New_York，自动识别 EDT 夏令时 UTC-4 与 EST 冬令时 UTC-5)
@@ -1809,7 +1833,7 @@ def get_us_market_schedule_state(now_utc=None):
     """
     if now_utc is None:
         now_utc = datetime.datetime.now(datetime.timezone.utc)
-    et_now = now_utc.astimezone(ZoneInfo("America/New_York"))
+    et_now, tz_name = _us_eastern_now(now_utc)
     is_weekday = et_now.weekday() < 5  # 0=Mon ... 4=Fri
     hm = et_now.hour * 60 + et_now.minute
 
@@ -1822,7 +1846,6 @@ def get_us_market_schedule_state(now_utc=None):
     # SEC EDGAR 法定开放时间为美东工作日 06:00 - 22:00 ET（前后各预留 5 分钟缓冲）
     is_sec_open = is_weekday and (5 * 60 + 55 <= hm <= 22 * 60 + 5)
 
-    tz_name = et_now.tzname() or "ET"
     et_str = f"{et_now.strftime('%Y-%m-%d %H:%M:%S')} {tz_name}"
     return {
         "is_high_freq_window": is_high_freq,
