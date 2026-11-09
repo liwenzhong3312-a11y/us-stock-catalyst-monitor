@@ -47,8 +47,10 @@
     - 邮件正文读取上限为 `28,000` 字符（超链接提取 35 条），**取消“只挑 3 条或 2~5 条”的人为数量限制，实行【应留尽留、全量提取】**！
     - 凡涉及 **① 个股与药企临床/商业化动态、② M&A 并购潜力/BD交易/融资、③ 宏观医药政策/FDA监管/医保药价博弈、④ 前沿靶点与顶刊转化突破** 四大维度的内容，**哪怕一封邮件有 8～16 条也必须 100% 全部保留并逐条翻译总结推送**，仅剔除纯求职招聘广告和纯会议买票促销。
 
-### (3) Gemini API 密钥轮询池与 24×7 自接力保活
+### (3) Gemini API 密钥轮询池与美东夏/冬令时自适应智能变频监控
 - **35 个独立配额桶**：`Config!B3` 中的 5 个 API 密钥 × 7 个 Gemini 模型（`gemini-3.5-flash`、`gemini-3.6-flash`、`gemini-3.5-flash-lite`、`gemini-flash-lite-latest`、`gemini-flash-latest`、`gemini-3-flash-preview`、`gemini-pro-latest`）自动轮询与 `HTTP 429` 无缝降级切换。
-- **GitHub Actions 24×7 保活 (`.github/workflows/monitor.yml`)**：
-  - 每轮常驻运行 14 分钟（每 60 秒优先执行 SEC + Yahoo + 直连 RSS + Gmail 巡检，随后在剩余时间预算内推进云盘 PDF 翻译），结束时通过 `if: always()` 兜底步驟自动触发下一棒 `workflow_dispatch`，配合 `*/15 * * * *` Cron 构成永不间断的云端自动化工作流。
+- **GitHub Actions 智能分时变频架构 (`.github/workflows/monitor.yml` + `get_us_market_schedule_state`)**：
+  - 自动基于美国纽约时间（`America/New_York`，自动切换 3 月夏令时 `EDT UTC-4` 与 11 月冬令时 `EST UTC-5`）分档运行：
+    1. **🔥 大盘前黄金窗口（美东工作日 `03:30 AM – 09:45 AM ET`）与盘后黄金窗口（美东工作日 `15:55 PM – 19:00 PM ET`）**：开启 **60 秒级高频常驻轮询 + 14 分钟自动无缝接力（`workflow_dispatch`）**，秒级捕捉欧洲早盘/医学大会、美股盘前临床数据/8-K、盘后财报 10-Q/10-K、定增融资与 Form 4。
+    2. **⚡ 盘中与夜间/周末非高峰时段**：由 `*/15 * * * *` Cron 定时唤醒，仅执行 **1 次快速全量扫描 + 云盘待译 PDF 翻译**，处理完毕后 **10 秒内直接干净退出**（不挂机空转、不死循环刷已关门的 SEC），兼顾 0 遗漏与极高效率。
 - **代码修改同步规范**：每次修改 `monitor.py`、`vault_sync.py` 或 `.github/workflows/monitor.yml` 后，必须执行 `git commit` 与 `git push origin main`，确保 GitHub 云端服务器立即运行最新代码。
