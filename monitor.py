@@ -958,26 +958,31 @@ def fetch_gmail_imap_events(config, portfolio, processed_ids, max_age_hours=24):
         mail.login(gmail_user, app_pwd)
         mail.select("INBOX")
         since_date = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)).strftime("%d-%b-%Y")
-        status, data = mail.search(None, f'(UNSEEN SINCE "{since_date}")')
+        status, data = mail.search(None, f'(SINCE "{since_date}")')
         if status != "OK" or not data or not data[0]:
             mail.logout()
             return events
 
         now_utc = datetime.datetime.now(datetime.timezone.utc)
-        msg_nums = data[0].split()[-25:]
+        msg_nums = data[0].split()[-35:]
         for num in reversed(msg_nums):
-            st, msg_data = mail.fetch(num, "(X-GM-MSGID RFC822)")
-            if st != "OK" or not msg_data or not msg_data[0]:
+            st_h, hdr_data = mail.fetch(num, "(X-GM-MSGID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID FROM SUBJECT DATE)])")
+            if st_h != "OK" or not hdr_data or not hdr_data[0]:
                 continue
-            hdr_meta = msg_data[0][0].decode("utf-8", errors="ignore") if isinstance(msg_data[0][0], bytes) else str(msg_data[0][0])
+            hdr_meta = hdr_data[0][0].decode("utf-8", errors="ignore") if isinstance(hdr_data[0][0], bytes) else str(hdr_data[0][0])
             gm_m = re.search(r"X-GM-MSGID\s+(\d+)", hdr_meta)
             gas_id = f"GAS_{hex(int(gm_m.group(1)))[2:]}" if gm_m else None
-            raw_email = msg_data[0][1]
-            msg = email.message_from_bytes(raw_email)
-            msg_id_hdr = (msg.get("Message-ID") or str(num)).strip()
+            hdr_msg = email.message_from_bytes(hdr_data[0][1]) if len(hdr_data[0]) > 1 and isinstance(hdr_data[0][1], bytes) else None
+            msg_id_hdr = ((hdr_msg.get("Message-ID") if hdr_msg else None) or str(num)).strip()
             gmail_id = "GMAIL_" + hashlib.sha1(msg_id_hdr.encode("utf-8")).hexdigest()[:16]
             if gmail_id in processed_ids or (gas_id and gas_id in processed_ids):
                 continue
+
+            st, msg_data = mail.fetch(num, "(BODY.PEEK[])")
+            if st != "OK" or not msg_data or not msg_data[0]:
+                continue
+            raw_email = msg_data[0][1]
+            msg = email.message_from_bytes(raw_email)
             ev_id = gas_id or gmail_id
 
             subject = decode_mime_str(msg.get("Subject", "(无标题)")).strip()
