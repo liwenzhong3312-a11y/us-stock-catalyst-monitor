@@ -37,9 +37,12 @@ jobs:
           ENABLE_GMAIL_IMAP: '1'
         run: python monitor.py
 
-      - name: Ensure 24x7 Self-Relay Dispatch (Fail-Safe)
+      - name: Ensure Peak-Window Self-Relay Dispatch (Fail-Safe)
         if: always()
         env:
           GSHEETS_TOKEN_JSON: ${{ secrets.GSHEETS_TOKEN_JSON }}
           SPREADSHEET_ID: '1pIKfEy9UNPs32W5gBFJu3N5doqU-SKCvIBDjX-TMwGQ'
-        run: python -c "import monitor; tok = monitor.get_google_access_token(); cfg, _, _, _ = monitor.load_sheet_state(tok); monitor.trigger_next_github_relay(cfg)"
+        run: |
+          if [ ! -f /tmp/relay_handled ]; then
+            python -c "import monitor; tok = monitor.get_google_access_token(); cfg, _, _, _ = monitor.load_sheet_state(tok); monitor.trigger_next_github_relay(cfg)"
+          fi

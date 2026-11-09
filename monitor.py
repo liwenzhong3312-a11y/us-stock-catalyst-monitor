@@ -30,6 +30,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from zoneinfo import ZoneInfo
 
 SPREADSHEET_ID = os.environ.get(
     "SPREADSHEET_ID", "1pIKfEy9UNPs32W5gBFJu3N5doqU-SKCvIBDjX-TMwGQ"
@@ -1798,8 +1799,53 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
         processed_titles.add(norm_title)
 
 
-def trigger_next_github_relay(config):
-    """在 14 分钟常驻循环结束前自动触发下一棒 GitHub Actions workflow_dispatch，消除 GitHub cron 延迟"""
+def get_us_market_schedule_state(now_utc=None):
+    """
+    基于美国纽约法定时间 (America/New_York，自动识别 EDT 夏令时 UTC-4 与 EST 冬令时 UTC-5)
+    返回当前所属的智能变频监控档位：
+    - is_high_freq_window: 是否处于美股工作日【大盘前黄金窗口 03:30-09:45 ET】或【盘后黄金窗口 15:55-19:00 ET】
+    - is_sec_open_window: 是否处于 SEC EDGAR 官方开放申报时段（美东周一至周五 05:55-22:05 ET）
+    - et_str: 当前美东时间字符串（含 EDT/EST 夏冬令时标识）
+    """
+    if now_utc is None:
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+    et_now = now_utc.astimezone(ZoneInfo("America/New_York"))
+    is_weekday = et_now.weekday() < 5  # 0=Mon ... 4=Fri
+    hm = et_now.hour * 60 + et_now.minute
+
+    # 1. 大盘前高频窗口：03:30 AM - 09:45 AM ET（覆盖欧洲早盘/医学大会 + 04:00 美股夜盘开启 + 06:00-09:30 盘前临床数据/8-K 密集爆发期）
+    is_premarket_peak = is_weekday and (3 * 60 + 30 <= hm <= 9 * 60 + 45)
+    # 2. 盘后高频窗口：15:55 PM - 19:00 PM ET（覆盖 16:00 收盘财报 10-Q/10-K、盘后闪电定增 S-3/424B5、Form 4 集中披露）
+    is_afterhours_peak = is_weekday and (15 * 60 + 55 <= hm <= 19 * 60)
+
+    is_high_freq = is_premarket_peak or is_afterhours_peak
+    # SEC EDGAR 法定开放时间为美东工作日 06:00 - 22:00 ET（前后各预留 5 分钟缓冲）
+    is_sec_open = is_weekday and (5 * 60 + 55 <= hm <= 22 * 60 + 5)
+
+    tz_name = et_now.tzname() or "ET"
+    et_str = f"{et_now.strftime('%Y-%m-%d %H:%M:%S')} {tz_name}"
+    return {
+        "is_high_freq_window": is_high_freq,
+        "is_sec_open_window": is_sec_open,
+        "et_now": et_now,
+        "et_str": et_str,
+    }
+
+
+def trigger_next_github_relay(config, force=False):
+    """在美东盘前/盘后黄金窗口内，于 14 分钟常驻循环结束前自动触发下一棒 GitHub Actions workflow_dispatch"""
+    try:
+        with open("/tmp/relay_handled", "w") as f:
+            f.write("1")
+    except Exception:
+        pass
+    sched = get_us_market_schedule_state()
+    if not force and not sched["is_high_freq_window"]:
+        print(
+            f"[INFO] Current US time ({sched['et_str']}) is outside high-frequency peak windows "
+            f"(03:30-09:45 ET & 15:55-19:00 ET). Skipping immediate self-relay; 15-min cron will handle next fast pass."
+        )
+        return
     gh_pat = (config.get("GITHUB_PAT") or os.environ.get("GITHUB_PAT") or "").strip()
     if not gh_pat:
         return
@@ -1823,7 +1869,7 @@ def trigger_next_github_relay(config):
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            print(f"[INFO] Successfully triggered next 24x7 GitHub Actions relay (HTTP {resp.status}).")
+            print(f"[INFO] Successfully triggered next high-frequency GitHub Actions relay at {sched['et_str']} (HTTP {resp.status}).")
     except Exception as e:
         print(f"[WARN] GitHub relay dispatch skipped: {e}")
 
@@ -1832,7 +1878,11 @@ def main(duration_minutes=0):
     access_token = get_google_access_token()
     config, portfolio, processed_ids, processed_titles = load_sheet_state(access_token)
 
-    print(f"[INFO] Loaded {len(portfolio)} active targets from Google Sheet: {[s['ticker'] for s in portfolio]}")
+    sched_init = get_us_market_schedule_state()
+    print(
+        f"[INFO] Loaded {len(portfolio)} active targets: {[s['ticker'] for s in portfolio]} | "
+        f"US Eastern Time: {sched_init['et_str']} (High-Freq Peak: {sched_init['is_high_freq_window']}, SEC Open: {sched_init['is_sec_open_window']})"
+    )
 
     # 启动时先毫秒级读取 Google Sheet 的 Vault 投研知识库，绝不在 SEC/新闻巡检前阻塞
     vault_knowledge = {}
@@ -1842,11 +1892,10 @@ def main(duration_minutes=0):
     except Exception as e:
         print(f"[WARN] Vault records load skipped or failed: {e}")
 
-    cik_map = fetch_sec_cik_map()
+    cik_map = fetch_sec_cik_map() if sched_init["is_sec_open_window"] or sched_init["is_high_freq_window"] else {}
 
-    # 持续常驻近实时流式监听循环模式
+    # 持续常驻或智能变频监听模式
     if duration_minutes > 0:
-        print(f"[INFO] Starting Continuous Real-Time Monitor Loop for {duration_minutes} minutes...")
         loop_start = time.time()
         end_time = loop_start + duration_minutes * 60 - 30  # 预留 30 秒安全退出
         last_rss_sec_check = 0
@@ -1854,17 +1903,21 @@ def main(duration_minutes=0):
         try:
             while time.time() < end_time:
                 now_t = time.time()
+                sched = get_us_market_schedule_state()
 
-                # 1. 每 60 秒轮询一次：优先执行 SEC EDGAR + Yahoo Finance RSS 实时监控，随后在剩余时间预算内推进 1 份投研库文献翻译
+                # 1. 在盘前/盘后黄金窗口内每 60 秒轮询一次；在非黄金窗口内仅执行 1 次快速全量巡检 + 云盘 PDF 翻译即干净退出
                 if now_t - last_rss_sec_check >= 60:
                     last_rss_sec_check = now_t
 
-                    for stock in portfolio:
-                        cik = cik_map.get(stock["ticker"])
-                        sec_ev = fetch_sec_edgar_events(stock, cik, max_age_hours=36)
-                        for ev in sec_ev:
-                            if ev["id"] not in processed_ids:
-                                process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
+                    if sched["is_sec_open_window"] or sched["is_high_freq_window"]:
+                        if not cik_map:
+                            cik_map = fetch_sec_cik_map()
+                        for stock in portfolio:
+                            cik = cik_map.get(stock["ticker"])
+                            sec_ev = fetch_sec_edgar_events(stock, cik, max_age_hours=36)
+                            for ev in sec_ev:
+                                if ev["id"] not in processed_ids:
+                                    process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
 
                     for stock in portfolio:
                         yf_ev = fetch_yahoo_direct_news(stock, max_age_hours=36)
@@ -1897,8 +1950,17 @@ def main(duration_minutes=0):
                         except Exception as ve:
                             print(f"[WARN] Periodic vault sync check error: {ve}")
 
+                    # 若当前不处于美东盘前/盘后高频窗口，完成本轮单次快速扫描与云盘翻译后立即干净退出，绝不空转挂机
+                    sched_after = get_us_market_schedule_state()
+                    if not sched_after["is_high_freq_window"]:
+                        print(
+                            f"[INFO] Single fast pass & Vault sync completed at {sched_after['et_str']}. "
+                            f"Exiting cleanly (outside high-frequency peak windows)."
+                        )
+                        break
+
                 time.sleep(10)
-            print(f"[INFO] Continuous Monitor Loop completed cleanly after {duration_minutes} minutes.")
+            print("[INFO] Monitor run completed cleanly.")
         finally:
             trigger_next_github_relay(config)
         return
