@@ -1856,19 +1856,13 @@ def get_us_market_schedule_state(now_utc=None):
 
 
 def trigger_next_github_relay(config, force=False):
-    """在美东盘前/盘后黄金窗口内，于 14 分钟常驻循环结束前自动触发下一棒 GitHub Actions workflow_dispatch"""
+    """在 14 分钟周期结束时自动触发下一棒 GitHub Actions workflow_dispatch，彻底消除 GitHub schedule cron 延迟与跳帧"""
     try:
         with open("/tmp/relay_handled", "w") as f:
             f.write("1")
     except Exception:
         pass
     sched = get_us_market_schedule_state()
-    if not force and not sched["is_high_freq_window"]:
-        print(
-            f"[INFO] Current US time ({sched['et_str']}) is outside high-frequency peak windows "
-            f"(03:30-09:45 ET & 15:55-19:00 ET). Skipping immediate self-relay; 15-min cron will handle next fast pass."
-        )
-        return
     gh_pat = (config.get("GITHUB_PAT") or os.environ.get("GITHUB_PAT") or "").strip()
     if not gh_pat:
         return
@@ -1892,7 +1886,8 @@ def trigger_next_github_relay(config, force=False):
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            print(f"[INFO] Successfully triggered next high-frequency GitHub Actions relay at {sched['et_str']} (HTTP {resp.status}).")
+            mode_tag = "HIGH-FREQ-PEAK" if sched["is_high_freq_window"] else "LOW-FREQ-CRUISE"
+            print(f"[INFO] Successfully triggered next GitHub Actions relay [{mode_tag}] at {sched['et_str']} (HTTP {resp.status}).")
     except Exception as e:
         print(f"[WARN] GitHub relay dispatch skipped: {e}")
 
@@ -1917,19 +1912,21 @@ def main(duration_minutes=0):
 
     cik_map = fetch_sec_cik_map() if sched_init["is_sec_open_window"] or sched_init["is_high_freq_window"] else {}
 
-    # 持续常驻或智能变频监听模式
+    # 持续常驻智能变频监听模式（公开仓库无限额度：高峰期 60s 极速轮询，非高峰期自动降频为 420s 低功耗巡航 + 90s 云盘秒级响应，彻底规避 GitHub Cron 跳帧迟到）
     if duration_minutes > 0:
         loop_start = time.time()
         end_time = loop_start + duration_minutes * 60 - 30  # 预留 30 秒安全退出
         last_rss_sec_check = 0
+        last_vault_check = 0
 
         try:
             while time.time() < end_time:
                 now_t = time.time()
                 sched = get_us_market_schedule_state()
+                # 高峰窗口（美东盘前 03:30-09:45 & 盘后 15:55-19:00）每 60 秒轮询；非高峰窗口每 420 秒（7 分钟）轻量巡检一次
+                news_interval = 60 if sched["is_high_freq_window"] else 420
 
-                # 1. 在盘前/盘后黄金窗口内每 60 秒轮询一次；在非黄金窗口内仅执行 1 次快速全量巡检 + 云盘 PDF 翻译即干净退出
-                if now_t - last_rss_sec_check >= 60:
+                if now_t - last_rss_sec_check >= news_interval:
                     last_rss_sec_check = now_t
 
                     if sched["is_sec_open_window"] or sched["is_high_freq_window"]:
@@ -1959,28 +1956,21 @@ def main(duration_minutes=0):
                             if ev["id"] not in processed_ids:
                                 process_single_event(ev, config, access_token, vault_knowledge, processed_ids, processed_titles)
 
-                    if os.environ.get("SYNC_DRIVE_VAULT", "0") == "1" and time.time() < end_time - 60:
-                        try:
-                            from vault_sync import sync_drive_vault
-                            vault_knowledge = sync_drive_vault(
-                                access_token,
-                                config,
-                                portfolio,
-                                send_pushplus_fn=send_pushplus,
-                                deadline=end_time - 25,
-                                max_files_per_pass=3,
-                            )
-                        except Exception as ve:
-                            print(f"[WARN] Periodic vault sync check error: {ve}")
-
-                    # 若当前不处于美东盘前/盘后高频窗口，完成本轮单次快速扫描与云盘翻译后立即干净退出，绝不空转挂机
-                    sched_after = get_us_market_schedule_state()
-                    if not sched_after["is_high_freq_window"]:
-                        print(
-                            f"[INFO] Single fast pass & Vault sync completed at {sched_after['et_str']}. "
-                            f"Exiting cleanly (outside high-frequency peak windows)."
+                # 云盘投研库每 90 秒轻量检查一次，确保北京时间白天随时上传 PDF 均可在 1~2 分钟内立即启动双栏翻译
+                if os.environ.get("SYNC_DRIVE_VAULT", "0") == "1" and (now_t - last_vault_check >= 90) and time.time() < end_time - 60:
+                    last_vault_check = time.time()
+                    try:
+                        from vault_sync import sync_drive_vault
+                        vault_knowledge = sync_drive_vault(
+                            access_token,
+                            config,
+                            portfolio,
+                            send_pushplus_fn=send_pushplus,
+                            deadline=end_time - 25,
+                            max_files_per_pass=3,
                         )
-                        break
+                    except Exception as ve:
+                        print(f"[WARN] Periodic vault sync check error: {ve}")
 
                 time.sleep(10)
             print("[INFO] Monitor run completed cleanly.")
