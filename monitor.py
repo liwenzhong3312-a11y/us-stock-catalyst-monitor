@@ -1598,60 +1598,79 @@ def translate_title_fallback(title, api_key):
 
 def gemini_translate_facts(ev, api_key):
     """
-    阶段一：100% 完整全文精译（严禁概括总结！）
-    严格提供：1. 英文原标题；2. 中文翻译标题；3. 【核心亮点 Highlights】逐条精译 + 【完整新闻稿正文与临床/财务数据表格】逐段逐表完整翻译
-    同时对 SEC Form 10-Q/10-K、Form S-3/424B5、Form 4 进行深度结构化中文提取与全量表格翻译。
+    阶段一智能双轨处理：
+    - 轨道 A（纯 SEC 法定申报文件：10-Q/10-K/S-3/424B5/Form 4/无新闻稿的 8-K/SC 13D/G）：
+      不进行冗长全文翻译，直接提炼核心数据与关键条款，并从股价【利好因素】与【利空/风险点】角度给出精炼研判。
+    - 轨道 B（官方新闻稿 EX-99.1 / 公关通稿 / 财经与生科新闻）：
+      100% 完整翻译主体内容与临床/财务数据表格（后续配合阶段二深度投研解读）。
     """
     stock = ev["stock"]
     sec_mode = ev.get("sec_mode", "")
-    sec_extra_rule = ""
-    if sec_mode == "10q_10k":
-        sec_extra_rule = """
-⚠️ 【SEC Form 10-Q / 10-K 季报/年报专项提取与翻译要求】：
-- 本文件为 SEC 10-Q/10-K 官方财务报告与 MD&A 管理层讨论。请务必完整翻译并清晰呈现：
-  1. **核心财务数据汇总与三表关键指标**（现金、现金等价物及短期投资总额、季度研发费用 R&D、管理费用 G&A、营业收入、净亏损及每股亏损 EPS、期末总股本，保留 Markdown 表格）；
-  2. **MD&A 业务与研发管线最新进展 (Overview)**（逐段完整翻译公司在报告期内披露的各临床管线进度、入组情况、里程碑时间表及最新战略调整）；
-  3. **流动性、资本资源与现金跑道 (Liquidity and Capital Resources)**（完整翻译管理层对账上现金可支撑运营至何时/Cash Runway 的官方原话表述，以及近期 ATM 增发或融资情况）。
-"""
-    elif sec_mode == "s3_424b":
-        sec_extra_rule = """
-⚠️ 【SEC Form S-3 / S-3ASR / 424B5 储架注册声明/招股书专项提取与翻译要求】：
-- 本文件为 SEC 融资注册声明/招股书。请务必从原文与 Filing Fee 表格中提取并完整翻译：
-  1. **注册声明性质与发行要素**（区分是“未指定具体金额、按需付费 Pay-as-you-go 的 WKSI 自动生效储架注册 S-3ASR”，还是“指定了最大注册金额的 S-3 或 424B5 招股书补充文件 / ATM 销售协议”，切勿把无具体金额的通用储架注册误称为已定增发行）；
-  2. **可发行证券类别、Filing Fee 表及授权股本概况**（普通股、优先股、债务证券、认股权证等）；
-  3. **募集资金用途 (Use of Proceeds)、公司概况及分销方式 (Plan of Distribution / ATM 安排)**。
-"""
-    elif sec_mode == "form4":
-        sec_extra_rule = """
-⚠️ 【SEC Form 4 内部人股权变动专项翻译要求】：
-- 请将已解析的 SEC Form 4 XML 结构化明细完整翻译为中文（含申报人姓名与职务、交易日期、交易代码 P/S/M/A/F 性质、增减持方向、成交股数、成交均价、变动后持股总数及全部官方 Footnotes 附注说明，保留 Markdown 表格）。
-"""
+    is_sec_filing_summary = sec_mode in ("10q_10k", "s3_424b", "form4", "8k_items", "general")
 
-    prompt = f"""请将以下关于生物科技公司 {stock['ticker']} ({stock['company']}) 的最新英文稿件进行 100% 完整、逐条、逐段、逐表的简体中文全文翻译。
+    if is_sec_filing_summary:
+        sec_focus_hint = ""
+        if sec_mode == "10q_10k":
+            sec_focus_hint = "（重点提炼：账面现金与短期投资总额、现金跑道 Cash Runway 可支撑至何时、季度营收/研发支出/管理费用/净亏损/EPS、以及本季度管线或监管实质性新变化）"
+        elif sec_mode == "s3_424b":
+            sec_focus_hint = "（重点提炼：区分是无限定金额的通用储架注册 S-3ASR 还是指定金额发行/ATM 协议、拟发行证券类别与承销商、募集资金用途及潜在股本稀释压力）"
+        elif sec_mode == "form4":
+            sec_focus_hint = "（重点提炼：申报人姓名与职务、交易代码 P=公开市场买入 / S=公开市场卖出 / M=期权行权 / F=例行扣税 / A=激励授予、股数、成交均价、变动后持股及 10b5-1 附注）"
+        elif sec_mode == "8k_items":
+            sec_focus_hint = "（重点提炼：8-K 各 Item 条款披露的实质合作/融资/信贷协议金额、高管任免、股本或监管重大事项）"
+
+        prompt = f"""请阅读以下关于生物科技公司 {stock['ticker']} ({stock['company']}) 的 SEC 官方申报文件，**不要进行全文逐字翻译**，而是直接为其提炼精简、直击重点的中文总结，并严格从**对股价的利好、利空影响角度**进行专业研判。
+
+【来源】：{ev['source']}
+【英文原标题】：{ev['title']}
+【SEC 文件核心原文节选】：
+{ev['body_en']}
+
+⚠️ 严格要求：
+1. **禁止全文翻译、禁止粘贴冗长原始财务三表**，总输出控制在 **450~750 字以内**，确保结构清晰、一屏可读完。
+2. {sec_focus_hint}
+3. 严格依据原文事实，未披露的数据写“原文未披露”，严禁臆测；严禁出现“买入、卖出、加仓、减仓、止盈、止损、暴涨、暴跌”等敏感字眼。
+4. 若该资料实际主语不是 {stock['company']} ({stock['ticker']})，请将 `[RELEVANT]` 设为 `NO`。
+
+请严格按以下纯文本标签格式输出（正文直接输出以下 4 个小节）：
+[RELEVANT]: YES 或 NO
+[CATEGORY]: 从以下选一：经营业绩 / 融资与股本 / 内部人变动 / 合作与并购 / 监管与上市 / 临床数据 / 常规行政
+[SCORE]: 1到10的整数（1-3=常规例行；4-6=一般财务/行政；7-8=实质融资/ATM/重要10-Q现金与管线更新/高管公开市场增减持；9-10=重大并购协议/大额主动增持或关键危机）
+[TITLE_CN]: 精炼准确的中文标题（含文件类型与核心事件，如：ABSI 提交 S-3ASR 自动储架注册声明 / ABSI 发布 Q3 10-Q 季报等）
+[BODY_CN_START]
+### 1. 📋 核心内容与关键数据提炼
+- （用 3~5 条简明要点列出核心数字、条款或交易明细）
+
+### 2. 📈 对股价的潜在利好因素
+- （从现金流安全边际、管线推进、内部人真金白银增持、融资灵活性等角度提炼积极信号；若无明显利好，写“例行申报，无明显新增利好”）
+
+### 3. 📉 对股价的潜在利空与风险点
+- （从潜在增发稀释/ATM 抛压、现金消耗加速、净亏损扩大、内部人减持等角度提示风险；若无明显利空，写“例行合规申报，无新增实质利空”）
+
+### 4. ⚖️ 综合股价影响定性
+- **定性结论**：【强利好 / 偏利好 / 中性常规 / 偏利空（稀释或减持承压） / 强利空】——用 1~2 句话点明最核心的定价逻辑。
+[BODY_CN_END]"""
+    else:
+        prompt = f"""请将以下关于生物科技公司 {stock['ticker']} ({stock['company']}) 的最新英文新闻/官方通稿进行**主体内容完整精译**（逐条、逐段、逐表翻译核心事实与数据）。
 
 【来源】：{ev['source']}
 【英文原标题】：{ev['title']}
 【英文原始全文】：
 {ev['body_en']}
-{sec_extra_rule}
+
 ⚠️ 铁律要求（违反任何一条均为不合格）：
-1. **严禁总结、严禁缩写、严禁省略任何段落或数据！** 必须对英文原稿进行从头到尾的**完整全文翻译**，绝不允许把几千字的新闻稿或财报概括成几百字的摘要！不要输出“【核心要点 (Highlights)】”或“【新闻稿完整正文与数据表格】”之类多余的分节小标题，直接输出内容！
-2. **开头导语要点 Highlights（全部加粗显示）**：新闻稿标题下方、正式电头（如 `CITY, State -- (BUSINESS WIRE / GLOBE NEWSWIRE) -- Date`）之前通常有若干条核心亮点导语（Highlights）。你必须在最开头用 `• **...**` 的格式（**整条要点用粗体 `**` 包裹**），**逐条、完整、一字不漏地翻译每一条 Highlight**（100%保留所有实验数据、终点名称、剂量组、百分比、p值与时间点）。
-3. **新闻稿完整正文与临床/财务数据表格**：
-   - 从电头（如 `华盛顿州温哥华和纽约 -- 2026年11月12日 -- ...`）开始，严格按照英文原稿的自然段落顺序，**逐段完整直译每一段正文**（包括 Recent Highlights、Pipeline Updates、Financial Results 财务业绩、管理层引语等所有章节）。
-   - **完整还原所有数据表格（如临床数据表、资产负债表 Balance Sheet、利润表 Statements of Operations 等）**：严禁用文字概述表格！英文原稿中的表格已展开为等宽列网格（每一行的 `|` 分隔单元格数量完全相等，跨列表头已按列重复展开，跨行分类已在首列重复展开）。你在翻译表格时，**每一行的 `|` 单元格总数必须与英文原表每一行的单元格总数 100% 严格相等**，以便下游渲染引擎自动合并生成完美的 `colspan` 跨列表头与 `rowspan` 跨行单元格！
-   - **完整翻译所有高管与临床专家（KOL）引语**：管理层与外部医学专家的每一段发言必须完整逐句翻译，不得删减。
-   - **完整翻译关于药物/临床项目/适应症/公司的背景段落（About ...）**：文末的 `About [Drug]`、`About the Clinical Program`、`About [Condition]`、`About [Company]` 段落也必须完整翻译（仅剔除 `Forward-Looking Statements` 法律免责套话及网站导航广告）。
-4. 若该资料实际主语不是 {stock['company']} ({stock['ticker']}) 或其研发管线（例如误抓了其他无关公司），请将 `[RELEVANT]` 设为 `NO`，`[SCORE]` 设为 `1`。
-5. 全文严禁出现“美股、炒股、买入、卖出、加仓、减仓、止盈、止损、暴涨、暴跌、基金经理、交易建议”等敏感字眼。
+1. **完整翻译主体内容，严禁缩写成几十字的摘要！** 必须逐条翻译开头 Highlights（用 `• **...**` 粗体格式），并逐段完整翻译电头后的新闻主体、管线临床数据、财务业绩与高管/专家引语（仅剔除 `Forward-Looking Statements` 法律免责套话及网站导航广告）。不要输出“【核心要点】”或“【正文】”之类多余分节小标题，直接输出内容。
+2. **完整还原所有数据表格（如 Table 1、Table 2 等）**：严禁用文字概述表格！英文原稿中的表格已展开为等宽列网格（每一行的 `|` 分隔单元格数量完全相等），你在翻译表格时，**每一行的 `|` 单元格总数必须与英文原表每一行的单元格总数 100% 严格相等**，以便下游渲染引擎自动合并生成完美的 `colspan` 与 `rowspan`。
+3. 若该资料实际主语不是 {stock['company']} ({stock['ticker']}) 或其研发管线（例如误抓了其他无关公司），请将 `[RELEVANT]` 设为 `NO`，`[SCORE]` 设为 `1`。
+4. 全文严禁出现“美股、炒股、买入、卖出、加仓、减仓、止盈、止损、暴涨、暴跌、基金经理、交易建议”等敏感字眼。
 
 请严格按照以下纯文本标签格式输出（不要输出 Markdown 代码块包裹）：
 [RELEVANT]: YES 或 NO
 [CATEGORY]: 从以下选一：临床数据 / 合作与并购 / 内部人变动 / 监管与上市 / 事项预告 / 经营业绩 / 融资与股本 / 行业报道 / 常规行政
-[SCORE]: 1到10的整数（1-3=无关或例行行政；4-6=一般报道；7-8=正式财报业绩/10-Q/10-K/S-3储架注册/重要管线进展/管理层增减持/合作里程碑；9-10=关键临床II/III期顶线数据/监管获批或CRL/收购并购）
+[SCORE]: 1到10的整数（1-3=无关或例行行政；4-6=一般报道；7-8=正式财报业绩/重要管线进展/会议预告/合作里程碑；9-10=关键临床II/III期顶线数据/监管获批或CRL/收购并购）
 [TITLE_CN]: 完整精准直译的中文标题
 [BODY_CN_START]
-（在此处输出包含【核心要点 (Highlights)】+【完整正文与财务/临床数据表格】的 100% 完整全文中文翻译）
+（在此处输出开头 Highlights + 新闻主体内容与数据表格的完整中文翻译）
 [BODY_CN_END]"""
 
     raw, used_model = call_gemini(
@@ -2155,6 +2174,8 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
     time_label = ev.get("time_label", "原始发布时间")
 
     # 智能识别纯日程/电话会预告 vs 正式发布的经营业绩财报 / SEC 核心申报文件
+    sec_mode = ev.get("sec_mode", "")
+    is_sec_filing_summary = sec_mode in ("10q_10k", "s3_424b", "form4", "8k_items", "general")
     is_schedule_notice = bool(
         re.search(r"(?i)to report .* financial results|conference call on|webcast on|announces date for|financial results on|to host .* conference call", ev["title"])
     )
@@ -2162,8 +2183,6 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
         category = "事项预告"
         score = min(score, 6)
     else:
-        sec_mode = ev.get("sec_mode", "")
-        # 正式财报新闻稿、SEC 8-K/10-Q/10-K/S-3/424B5、以及包含公开市场买卖的 Form 4 强制达到深度解读阈值 (>=8)
         if sec_mode in ("press_release", "8k_items", "10q_10k", "s3_424b"):
             score = max(score, 8)
         elif sec_mode == "form4" and re.search(r"Code [PS]", ev["title"]):
@@ -2174,7 +2193,7 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
         ):
             score = max(score, 8)
 
-    # 准备深度解读（条件：高分、有实质长文、且非纯日程预告）
+    # 准备深度解读（条件：高分、有实质长文、非纯日程预告，且非已一步完成利好/利空精炼的纯 SEC 法定申报）
     deep_text = ""
     deep_model_label = ""
     vault_badge = ""
@@ -2184,6 +2203,7 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
         and len(body_cn.strip()) >= 120
         and "仅含标题" not in body_cn
         and not is_schedule_notice
+        and not is_sec_filing_summary
     )
 
     if can_deep_analyze:
@@ -2201,7 +2221,12 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
 
     # 构建统一单条推送（深色/浅色模式 100% 自适应高对比度排版，绝不硬编码黑底黑字或白底白字）
     has_deep = bool(deep_text)
-    badge = f"【{'官方' if is_official else '第三方'}{'·深度' if has_deep else ''}】"
+    if is_sec_filing_summary:
+        badge = "【SEC精炼】"
+        body_section_title = "📊 SEC 核心提炼与股价利好/利空研判："
+    else:
+        badge = f"【{'官方' if is_official else '第三方'}{'·深度' if has_deep else ''}】"
+        body_section_title = "📄 新闻主体内容精译与核心数据："
     push_title = f"{badge}{stock['ticker']} | {title_cn}"
 
     deep_card_html = ""
@@ -2240,7 +2265,7 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
       {deep_card_html}
       <hr style="border:none;border-top:1px solid rgba(128,128,128,0.3);margin:10px 0;"/>
       <div style="margin:8px 0;font-size:14px;line-height:1.72;">
-        <div style="font-weight:bold;margin-bottom:6px;font-size:13.5px;">📄 事实全文直译与临床数据：</div>
+        <div style="font-weight:bold;margin-bottom:6px;font-size:13.5px;">{body_section_title}</div>
         {format_body_for_wechat_html(body_cn)}
       </div>
       <hr style="border:none;border-top:1px solid rgba(128,128,128,0.3);margin:10px 0;"/>
@@ -2252,7 +2277,10 @@ def process_single_event(ev, config, access_token, vault_knowledge, processed_id
 
     send_pushplus(push_token, push_title, unified_html)
     print(f"[INFO] Sent Unified Single Push: {push_title} (score={score}, has_deep={has_deep})")
-    log_deep_text = deep_text if deep_text else "未达深度解读阈值或为短快讯（已整合推送事实全貌）"
+    if is_sec_filing_summary:
+        log_deep_text = "SEC 法定申报已直接按股价利好/利空视角精炼总结（无需全文翻译）"
+    else:
+        log_deep_text = deep_text if deep_text else "未达深度解读阈值或为短快讯（已整合推送事实全貌）"
 
     bj_time = (
         datetime.datetime.now(datetime.timezone.utc)
